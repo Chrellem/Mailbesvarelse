@@ -1,3 +1,4 @@
+# Opdateret streamlit prototype med deadline-detektion
 import os
 import re
 import pandas as pd
@@ -14,7 +15,6 @@ TEMPLATES_CSV = os.getenv("TEMPLATES_CSV", "templates_suggestions.csv")
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() in ("1", "true", "yes")
 
 st.set_page_config(page_title="Mail‑besvarelse Prototype", layout="wide")
-
 st.title("Prototype: Mail‑besvarelse (path → template)")
 
 st.sidebar.header("Konfiguration")
@@ -32,9 +32,8 @@ def load_requirements(path):
 @st.cache_data(ttl=60)
 def load_templates(path):
     if not os.path.exists(path):
-        return pd.DataFrame()
+        return {}
     df = pd.read_csv(path, dtype=str).fillna("")
-    # normalize allowed_path_patterns column
     if "allowed_path_patterns" in df.columns:
         df["allowed_path_patterns"] = df["allowed_path_patterns"].apply(lambda s: [p.strip() for p in s.split(",") if p.strip()] if s else [])
     else:
@@ -61,15 +60,31 @@ def detect_country(text):
     return "*"  # unknown
 
 def split_keywords(cell):
-    return [k.strip().lower() for k in (cell or "").split(",") if k.strip()]
+    """
+    Return cleaned keywords list.
+    - Trim whitespace
+    - Lowercase
+    - Keep numeric tokens and short tokens if they contain digits or punctuation (so '5 juli' can be a keyword)
+    - Ignore overly generic tokens like 'ap' unless explicitly present as phrase 'ap-test'
+    """
+    out = []
+    for k in (cell or "").split(","):
+        k = k.strip().lower()
+        if not k:
+            continue
+        # keep tokens with digits (dates like '5 juli') and tokens >= 3 chars,
+        # or tokens containing '-' or space (phrases like 'ap-test' or '5 juli')
+        if len(k) < 3 and ("-" not in k and " " not in k and not any(ch.isdigit() for ch in k)):
+            # ignore too-short non-numeric tokens like 'ap'
+            continue
+        out.append(k)
+    return out
 
 def path_specificity(path):
-    # higher = more specific (fewer wildcards)
     toks = path.split("/")
     return sum(1 for t in toks if t != "*" and t != "")
 
 def path_matches_pattern(path, pattern):
-    # token-by-token match with '*' wildcard token only
     p_toks = path.split("/")
     pat_toks = pattern.split("/")
     if len(p_toks) != len(pat_toks):
@@ -81,39 +96,92 @@ def path_matches_pattern(path, pattern):
             return False
     return True
 
-def find_candidates(req_df, text, country_code):
+def keyword_matches_text(text, kw):
+    """
+    Use regex word boundaries for keyword matching.
+    For keywords with digits or containing spaces/dashes, build a phrase match.
+    """
+    if not kw:
+        return False
+    kw_escaped = re.escape(kw)
+    # If kw contains digits or non-letter (space or dash), match the phrase exactly (still case-insensitive)
+    if re.search(r'[\d\W]', kw):
+        pattern = r'(?i)\b' + kw_escaped + r'\b'
+    else:
+        pattern = r'(?i)\b' + kw_escaped + r'\b'
+    try:
+        return re.search(pattern, text, flags=0) is not None
+    except re.error:
+        return kw in text
+
+# New: detect explicit deadline references (e.g. "5 juli", "5 July", "5. juli", "5/7", "5.7")
+DEADLINE_PATTERNS = [
+    r'\b5[\s\./-]*(?:juli|jul|july)\b',
+    r'\b5[\s\./-]*(?:7|07)\b',           # 5/7 or 5.7 forms
+    r'\b5(?:th|st|nd|rd)?\s*(?:july|juli)\b',
+    r'\bJuly\s*5\b',
+    r'\b5\s*July\b'
+]
+
+def detect_deadline_reference(text):
     t = normalize_text(text)
-    # filter rows by country_code or wildcard
-    df = req_df[(req_df["country_code"] == country_code) | (req_df["country_code"] == "*")]
+    for pat in DEADLINE_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            # return the matched string for debug
+            m = re.search(pat, t, flags=re.IGNORECASE)
+            return True, (m.group(0) if m else "5 juli")
+    return False, None
+
+def find_candidates(req_df, text, country_code):
+    """
+    Return list of candidate tuples: (row_series, matched_keywords_list, match_count)
+    This function now also tries a special deadline-detection before normal keyword matching.
+    """
+    t = normalize_text(text)
     candidates = []
+
+    # 1) deadline detection: if found, add all deadline rows as candidates (country-specific first)
+    found_deadline, matched_deadline = detect_deadline_reference(text)
+    if found_deadline:
+        # prefer rows where topic == 'deadlines' or path contains '/deadlines/'
+        df_deadline = req_df[(req_df["topic"].str.lower() == "deadlines") | (req_df["path"].str.contains("/deadlines/"))]
+        # also allow country-specific deadlines first
+        df_deadline_specific = df_deadline[(df_deadline["country_code"] == country_code) | (df_deadline["country_code"] == "*")]
+        for _, row in df_deadline_specific.iterrows():
+            candidates.append((row, [matched_deadline], 1))
+        if candidates:
+            return candidates
+
+    # 2) normal keyword matching against rows for country_code or wildcard
+    df = req_df[(req_df["country_code"] == country_code) | (req_df["country_code"] == "*")]
     for _, row in df.iterrows():
         kws = split_keywords(row.get("question_keywords",""))
+        matched = []
         for kw in kws:
-            if kw and kw in t:
-                candidates.append((row, kw))
-                break
+            if keyword_matches_text(t, kw):
+                matched.append(kw)
+        if matched:
+            matched_unique = sorted(set(matched), key=lambda x: matched.index(x))
+            candidates.append((row, matched_unique, len(matched_unique)))
+
     return candidates
 
 def choose_best(candidates):
     if not candidates:
-        return None, None
-    # Exclude rows with exclude_flag true
-    filtered = [(r, kw) for r, kw in candidates if str(r.get("exclude_flag","")).lower() not in ("true","1","yes")]
-    if not filtered:
-        return candidates[0]  # fallback to first even if excluded
-    # sort by specificity (desc), then priority (asc int)
+        return None, None, 0
+    non_excluded = [c for c in candidates if str(c[0].get("exclude_flag","")).lower() not in ("true","1","yes")]
+    pool = non_excluded if non_excluded else candidates
     def sort_key(item):
-        r, _ = item
-        spec = path_specificity(r.get("path",""))
-        pr = int(r.get("priority") or 1000)
-        return (-spec, pr)
-    filtered.sort(key=sort_key)
-    return filtered[0]
+        row, matched, count = item
+        spec = path_specificity(row.get("path",""))
+        pr = int(row.get("priority") or 1000)
+        return (-count, -spec, pr)
+    pool_sorted = sorted(pool, key=sort_key)
+    return pool_sorted[0]  # (row, matched_keywords, match_count)
 
 def render_template(template_meta, row, slots):
     subj_tpl = template_meta.get("subject_template","")
     body_tpl = template_meta.get("body_template","")
-    # Render with Jinja2
     try:
         subj = Template(subj_tpl).render(**slots)
         body = Template(body_tpl).render(**slots)
@@ -146,25 +214,29 @@ else:
     combined = f"{subject}\n\n{body}"
     country = detect_country(combined)
     st.markdown(f"**Detected country_code:** `{country}`")
+
+    # Find candidates (deadline detection included)
     candidates = find_candidates(req_df, combined, country)
     if not candidates:
         st.error("Ingen keyword‑match fundet. Forsøg med en anden formulering eller brug fallback/manuel review.")
         st.stop()
+
     # Show candidates
-    st.write("Kandidater fundet (rad og trigger keyword):")
+    st.write("Kandidater fundet (rad, matched keywords og match_count):")
     cand_table = []
-    for r, kw in candidates:
+    for r, matched, count in candidates:
         cand_table.append({
             "id": r.get("id",""),
             "path": r.get("path",""),
             "country_code": r.get("country_code",""),
             "priority": r.get("priority",""),
-            "matched_keyword": kw,
+            "matched_keywords": ", ".join(matched),
+            "match_count": count,
             "exclude_flag": r.get("exclude_flag","")
         })
     st.table(pd.DataFrame(cand_table))
 
-    best_row, used_kw = choose_best(candidates)
+    best_row, best_matched, best_count = choose_best(candidates)
     if best_row is None:
         st.error("Kun ekskluderede rækker fundet eller ingen gyldig kandidat.")
         st.stop()
@@ -180,7 +252,8 @@ else:
         "requirements_cache": best_row.get("requirements_cache",""),
         "priority": best_row.get("priority",""),
         "exclude_flag": best_row.get("exclude_flag",""),
-        "matched_keyword": used_kw
+        "matched_keywords": best_matched,
+        "match_count": best_count
     })
 
     tpl_id = best_row.get("response_template_id","")
@@ -189,7 +262,6 @@ else:
         st.error(f"Template '{tpl_id}' ikke fundet i templates CSV.")
         st.stop()
 
-    # Check allowed patterns
     allowed = tpl_meta.get("allowed_path_patterns", [])
     path_ok = False
     if not allowed:
@@ -204,7 +276,6 @@ else:
     if str(tpl_meta.get("sensitivity","")).lower() in ("sensitive", "true"):
         st.warning(f"Template '{tpl_id}' er markeret som sensitive; overvej manuel behandling.")
 
-    # Prepare slots
     slots = {
         "applicant_name": applicant_name or "Ansøger",
         "program": program or "det valgte program",
