@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+.venv/
+venv/
+# IDE
+.vscode/
+.idea/
+# secrets / service account keys (ALDRIG commit)
+*.json
