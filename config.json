@@ -1,0 +1,5 @@
+{
+  "blacklist_keywords": ["retssager", "legal", "advokat", "betalingstvister", "juridisk"],
+  "manual_review_threshold": 0.5,
+  "test_mode": true
+}
