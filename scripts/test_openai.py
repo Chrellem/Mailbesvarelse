@@ -1,4 +1,3 @@
-# scripts/test_openai.py
 import os
 import sys
 
