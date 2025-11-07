@@ -10,3 +10,4 @@ requests>=2.31.0
 openai>=0.28.0  # optional - kun hvis du vil bruge OpenAI/LLM
 python-multipart>=0.0.6  # til file uploads i Streamlit hvis nødvendigt
 urllib3>=2.0.0
+pip install sentence-transformers torch numpy pandas streamlit jinja2 python-dotenv openai
