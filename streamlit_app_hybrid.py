@@ -27,6 +27,68 @@ except Exception:
 
 load_dotenv()
 
+# --- Start: OpenAI secrets + debug (indsæt efter load_dotenv() i toppen af filen) ---
+import os
+import streamlit as st
+
+# Hent OpenAI key: først fra Streamlit secrets (st.secrets), ellers fra env var (.env eller host env)
+OPENAI_API_KEY = None
+try:
+    # st.secrets er en mapping i Streamlit Cloud / lokalt .streamlit/secrets.toml
+    if isinstance(st.secrets, dict) and "OPENAI_API_KEY" in st.secrets:
+        OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    else:
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+except Exception:
+    # Hvis st.secrets ikke er tilgængelig (meget gamle Streamlit), fallback til env
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# Vis kun om nøgle er tilgængelig (vis ikke selve nøglen)
+st.sidebar.write("OPENAI API key tilgængelig:", bool(OPENAI_API_KEY))
+
+# Opsæt openai klient (hvis pakken er installeret)
+try:
+    import openai
+    if OPENAI_API_KEY:
+        openai.api_key = OPENAI_API_KEY
+except Exception:
+    # Hvis openai ikke er installeret eller import fejler, så ignorer her — app håndterer manglende openai senere
+    openai = None
+
+# Debug-knap til at teste OpenAI‑forbindelsen direkte fra UI (fjern efter brug)
+import traceback
+def openai_debug_test():
+    st.sidebar.markdown("### Debug: OpenAI connection")
+    if st.sidebar.button("Test OpenAI connection"):
+        with st.spinner("Tester OpenAI‑forbindelse…"):
+            try:
+                key_set = bool(OPENAI_API_KEY)
+                st.sidebar.write("OPENAI_API_KEY set: " + str(key_set))
+                if not key_set:
+                    st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj den i .streamlit/secrets.toml eller i din host's env.")
+                    return
+                if openai is None:
+                    # prøv at importere her for mere detaljeret fejl hvis nødvendigt
+                    import openai as _openai
+                    _openai.api_key = OPENAI_API_KEY
+                    resp = _openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":"Ping"}], max_tokens=1)
+                else:
+                    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":"Ping"}], max_tokens=1)
+                st.success("OpenAI test OK — modtog svar.")
+                try:
+                    keys = list(resp.keys())
+                except Exception:
+                    keys = ["(kunne ikke læse respons keys)"]
+                st.sidebar.json({"response_keys": keys})
+            except Exception as e:
+                st.error(f"OpenAI test fejlede: {type(e).__name__}: {e}")
+                tb = traceback.format_exc()
+                st.sidebar.text_area("Traceback (debug)", value=tb, height=300)
+
+# Kald debug‑knappen (placér kaldet et passende sted efter konfigurationen)
+openai_debug_test()
+# --- End: OpenAI secrets + debug ---
+
 # Config
 REQUIREMENTS_CSV = os.getenv("REQUIREMENTS_CSV", "sheets/requirements_suggestions.csv")
 TEMPLATES_CSV = os.getenv("TEMPLATES_CSV", "sheets/templates_suggestions.csv")
