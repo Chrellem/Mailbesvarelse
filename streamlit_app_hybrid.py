@@ -7,6 +7,7 @@ Place this file in repo root as streamlit_app_hybrid.py.
 import os
 import re
 import json
+import traceback
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -19,7 +20,7 @@ try:
 except Exception:
     SentenceTransformer = None
 
-# OpenAI client
+# Try import openai (may be v0.x or v1.x)
 try:
     import openai
 except Exception:
@@ -27,72 +28,9 @@ except Exception:
 
 load_dotenv()
 
-# --- Start: OpenAI secrets + debug (indsæt efter load_dotenv() i toppen af filen) ---
-import os
-import streamlit as st
-
-# Hent OpenAI key: først fra Streamlit secrets (st.secrets), ellers fra env var (.env eller host env)
-OPENAI_API_KEY = None
-try:
-    # st.secrets er en mapping i Streamlit Cloud / lokalt .streamlit/secrets.toml
-    if isinstance(st.secrets, dict) and "OPENAI_API_KEY" in st.secrets:
-        OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    else:
-        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-except Exception:
-    # Hvis st.secrets ikke er tilgængelig (meget gamle Streamlit), fallback til env
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-# Vis kun om nøgle er tilgængelig (vis ikke selve nøglen)
-st.sidebar.write("OPENAI API key tilgængelig:", bool(OPENAI_API_KEY))
-
-# Opsæt openai klient (hvis pakken er installeret)
-try:
-    import openai
-    if OPENAI_API_KEY:
-        openai.api_key = OPENAI_API_KEY
-except Exception:
-    # Hvis openai ikke er installeret eller import fejler, så ignorer her — app håndterer manglende openai senere
-    openai = None
-
-# Debug-knap til at teste OpenAI‑forbindelsen direkte fra UI (fjern efter brug)
-import traceback
-def openai_debug_test():
-    st.sidebar.markdown("### Debug: OpenAI connection")
-    if st.sidebar.button("Test OpenAI connection"):
-        with st.spinner("Tester OpenAI‑forbindelse…"):
-            try:
-                key_set = bool(OPENAI_API_KEY)
-                st.sidebar.write("OPENAI_API_KEY set: " + str(key_set))
-                if not key_set:
-                    st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj den i .streamlit/secrets.toml eller i din host's env.")
-                    return
-                if openai is None:
-                    # prøv at importere her for mere detaljeret fejl hvis nødvendigt
-                    import openai as _openai
-                    _openai.api_key = OPENAI_API_KEY
-                    resp = _openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":"Ping"}], max_tokens=1)
-                else:
-                    resp = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=[{"role":"user","content":"Ping"}], max_tokens=1)
-                st.success("OpenAI test OK — modtog svar.")
-                try:
-                    keys = list(resp.keys())
-                except Exception:
-                    keys = ["(kunne ikke læse respons keys)"]
-                st.sidebar.json({"response_keys": keys})
-            except Exception as e:
-                st.error(f"OpenAI test fejlede: {type(e).__name__}: {e}")
-                tb = traceback.format_exc()
-                st.sidebar.text_area("Traceback (debug)", value=tb, height=300)
-
-# Kald debug‑knappen (placér kaldet et passende sted efter konfigurationen)
-openai_debug_test()
-# --- End: OpenAI secrets + debug ---
-
 # Config
 REQUIREMENTS_CSV = os.getenv("REQUIREMENTS_CSV", "sheets/requirements_suggestions.csv")
 TEMPLATES_CSV = os.getenv("TEMPLATES_CSV", "sheets/templates_suggestions.csv")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
 TEST_MODE = os.getenv("TEST_MODE", "true").lower() in ("1", "true", "yes")
@@ -106,17 +44,131 @@ SPECIFICITY_BOOST = float(os.getenv("SPECIFICITY_BOOST", "0.01"))
 st.set_page_config(page_title="Mail‑besvarelse Prototype (Hybrid)", layout="wide")
 st.title("Prototype: Mail‑besvarelse (hybrid semantic + keywords + LLM)")
 
-st.sidebar.header("Konfiguration")
-st.sidebar.text_input("Requirements CSV", value=REQUIREMENTS_CSV, key="req_path")
-st.sidebar.text_input("Templates CSV", value=TEMPLATES_CSV, key="tpl_path")
-st.sidebar.text_input("OpenAI model", value=OPENAI_MODEL, key="openai_model")
-use_openai_default = bool(OPENAI_API_KEY and openai is not None)
-st.sidebar.checkbox("Use OpenAI for slot extraction/confirmation", value=use_openai_default, key="use_openai")
-st.sidebar.markdown(f"High threshold: {HIGH_THRESHOLD}  —  Mid threshold: {MID_THRESHOLD}")
+# --- Start: OpenAI secrets handling ---
+# Hent OpenAI key: først fra Streamlit secrets (st.secrets), ellers fra env var (.env eller host env)
+OPENAI_API_KEY = None
+try:
+    if isinstance(st.secrets, dict) and "OPENAI_API_KEY" in st.secrets:
+        OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    else:
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+except Exception:
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-if openai is not None and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+# Vis kun om nøgle er tilgængelig (vis ikke selve nøglen)
+st.sidebar.write("OPENAI API key tilgængelig:", bool(OPENAI_API_KEY))
 
+# Hvis openai modul findes, prøv at sætte api_key for ældre brug (nogle versioner bruger openai.api_key)
+if openai is not None:
+    try:
+        if OPENAI_API_KEY:
+            # for compatibility with old code paths that check openai.api_key
+            try:
+                openai.api_key = OPENAI_API_KEY
+            except Exception:
+                pass
+    except Exception:
+        pass
+# --- End secrets handling ---
+
+
+# --- Compatibility wrapper for OpenAI library versions ---
+def create_chat_completion(messages, model=None, max_tokens=400, temperature=0.0):
+    """
+    Wrapper that supports both:
+      - openai>=1.0.0 (OpenAI client): client.chat.completions.create(...)
+      - openai<1.0.0: openai.ChatCompletion.create(...)
+    Returns tuple (text, resp). Raises exceptions from underlying client on failure.
+    """
+    model = model or OPENAI_MODEL
+
+    if openai is None:
+        raise RuntimeError("openai package not installed")
+
+    # Try new API (openai.OpenAI client)
+    try:
+        OpenAI = getattr(openai, "OpenAI", None)
+        if OpenAI:
+            # instantiate client with key if provided
+            client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            # attempt to extract text from new response shape
+            try:
+                text = resp.choices[0].message.content
+            except Exception:
+                # fallback to dict-like access
+                try:
+                    text = resp["choices"][0]["message"]["content"]
+                except Exception:
+                    text = str(resp)
+            return text, resp
+    except Exception:
+        # fall through to older API attempt
+        pass
+
+    # Fallback to older API
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        text = resp["choices"][0]["message"]["content"]
+        return text, resp
+    except Exception:
+        # re-raise to allow caller to handle/log
+        raise
+
+# --- Debug-knap til at teste OpenAI‑forbindelsen direkte fra UI (fjern efter brug) ---
+def openai_debug_test():
+    st.sidebar.markdown("### Debug: OpenAI connection")
+    if st.sidebar.button("Test OpenAI connection"):
+        with st.spinner("Tester OpenAI‑forbindelse…"):
+            try:
+                key_set = bool(OPENAI_API_KEY)
+                st.sidebar.write("OPENAI_API_KEY set: " + str(key_set))
+                if not key_set:
+                    st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj den i .streamlit/secrets.toml eller i din host's env.")
+                    return
+                if openai is None:
+                    st.error("openai-pakken er ikke installeret i dette miljø.")
+                    return
+
+                # Build simple test message
+                messages = [{"role": "user", "content": "Ping"}]
+                try:
+                    text, resp = create_chat_completion(messages, model="gpt-3.5-turbo", max_tokens=1, temperature=0.0)
+                except Exception as e:
+                    st.error(f"OpenAI test fejlede: {type(e).__name__}: {e}")
+                    tb = traceback.format_exc()
+                    st.sidebar.text_area("Traceback (debug)", value=tb, height=300)
+                    return
+
+                st.success("OpenAI test OK — modtog svar.")
+                # try to show non-sensitive resp info
+                try:
+                    if isinstance(resp, dict):
+                        keys = list(resp.keys())
+                    else:
+                        keys = [k for k in dir(resp)[:60]]
+                except Exception:
+                    keys = ["(kunne ikke læse respons keys)"]
+                st.sidebar.json({"response_keys": keys})
+            except Exception as e:
+                st.error(f"OpenAI test fejlede: {type(e).__name__}: {e}")
+                tb = traceback.format_exc()
+                st.sidebar.text_area("Traceback (debug)", value=tb, height=300)
+
+# Kald debug knap (fjern denne linje efter du har debugget)
+openai_debug_test()
+
+# --- App helper functions (embeddings, matching, etc.) ---
 @st.cache_data(ttl=120)
 def load_requirements(path):
     if not os.path.exists(path):
@@ -232,6 +284,7 @@ def keyword_boost_for_row(row, incoming_text):
             matched += 1
     return matched * KEYWORD_BOOST, matched
 
+# Updated call_openai_slot_extractor to use compatibility wrapper
 def call_openai_slot_extractor(mail_text, candidate_rows):
     if openai is None or not OPENAI_API_KEY:
         return None
@@ -252,19 +305,14 @@ def call_openai_slot_extractor(mail_text, candidate_rows):
         f"Candidate contexts (id/path/short):\n{json.dumps(ctx, ensure_ascii=False, indent=2)}\n\n"
         "Returner et enkelt JSON-objekt med felterne: country_code, intent, program, applicant_name, missing_info (array), confidence (0-1)."
     )
+    messages = [{"role": "system", "content": system}, {"role":"user", "content": user}]
     try:
-        resp = openai.ChatCompletion.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":system}, {"role":"user","content":user}],
-            temperature=0.0,
-            max_tokens=400
-        )
-        out = resp["choices"][0]["message"]["content"].strip()
+        out_text, resp = create_chat_completion(messages, model=OPENAI_MODEL, max_tokens=400, temperature=0.0)
         try:
-            parsed = json.loads(out)
+            parsed = json.loads(out_text)
             return parsed
         except Exception:
-            m = re.search(r'(\{[\s\S]*\})', out)
+            m = re.search(r'(\{[\s\S]*\})', out_text)
             if m:
                 try:
                     return json.loads(m.group(1))
@@ -275,7 +323,7 @@ def call_openai_slot_extractor(mail_text, candidate_rows):
         st.error(f"OpenAI call failed: {e}")
         return None
 
-# --- Ny funktion: generer draft reply via OpenAI ---
+# New draft generation using compatibility wrapper
 def generate_draft_reply(mail_text, top_candidates, templates_dict, openai_model=OPENAI_MODEL):
     """
     Returnerer dict med keys: subject, body, confidence, notes
@@ -305,25 +353,20 @@ def generate_draft_reply(mail_text, top_candidates, templates_dict, openai_model
         "Returner kun et JSON‑objekt (ingen ekstra tekst)."
     )
 
+    messages = [{"role":"system", "content": system}, {"role":"user", "content": user}]
     try:
-        resp = openai.ChatCompletion.create(
-            model=openai_model,
-            messages=[{"role":"system","content":system}, {"role":"user","content":user}],
-            temperature=0.3,
-            max_tokens=500
-        )
-        out = resp["choices"][0]["message"]["content"].strip()
+        out_text, resp = create_chat_completion(messages, model=openai_model, max_tokens=500, temperature=0.3)
         try:
-            parsed = json.loads(out)
+            parsed = json.loads(out_text)
             return parsed
         except Exception:
-            m = re.search(r'(\{[\s\S]*\})', out)
+            m = re.search(r'(\{[\s\S]*\})', out_text)
             if m:
                 try:
                     return json.loads(m.group(1))
                 except Exception:
-                    return {"subject": "", "body": out, "confidence": 0.0, "notes": "Kunne ikke parse fuld JSON; se body."}
-            return {"subject": "", "body": out, "confidence": 0.0, "notes": "Ingen JSON fundet i modeloutput."}
+                    return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Kunne ikke parse fuld JSON; se body."}
+            return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Ingen JSON fundet i modeloutput."}
     except Exception as e:
         return {"subject": "", "body": f"Fejl ved opkald til OpenAI: {e}", "confidence": 0.0, "notes": "OpenAI-fejl"}
 
@@ -466,7 +509,6 @@ else:
                 st.info(f"Notes: {draft.get('notes')}")
             st.success("Rediger forslaget og kopier/brug det i din mailklient. App'en sender ikke automatisk.")
         else:
-            # fallback tekst hvis OpenAI ikke er tilgængelig eller fejlede
             st.info("OpenAI ikke tilgængelig eller fejl i opkald. Viser generisk fallback‑forslag.")
             fallback_lines = []
             for r, sim, mc, spec, comb in topk[:3]:
