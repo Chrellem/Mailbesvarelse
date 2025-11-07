@@ -1,8 +1,12 @@
 """
 Hybrid Streamlit prototype:
 - sentence-transformers local embeddings for semantic search
-- OpenAI ChatCompletion for draft generation and slot extraction/confirmation
-Place this file in repo root as streamlit_app_hybrid.py.
+- OpenAI ChatCompletion (compatibility wrapper + REST fallback) for draft generation and slot extraction/confirmation
+
+Placer denne fil i repo-roden som streamlit_app_hybrid.py og genstart streamlit:
+  streamlit run streamlit_app_hybrid.py
+
+Bemærk: Sæt OPENAI_API_KEY enten i Streamlit Secrets (st.secrets) eller som miljøvariabel (.env eller host env).
 """
 import os
 import re
@@ -20,7 +24,7 @@ try:
 except Exception:
     SentenceTransformer = None
 
-# Try import openai (may be v0.x or v1.x)
+# Try import openai (may be v0.x or v1.x); ok if missing (we have REST fallback)
 try:
     import openai
 except Exception:
@@ -62,7 +66,6 @@ st.sidebar.write("OPENAI API key tilgængelig:", bool(OPENAI_API_KEY))
 if openai is not None:
     try:
         if OPENAI_API_KEY:
-            # for compatibility with old code paths that check openai.api_key
             try:
                 openai.api_key = OPENAI_API_KEY
             except Exception:
@@ -72,58 +75,81 @@ if openai is not None:
 # --- End secrets handling ---
 
 
-# --- Compatibility wrapper for OpenAI library versions ---
+# --- Robust compatibility wrapper for OpenAI chat completions ---
 def create_chat_completion(messages, model=None, max_tokens=400, temperature=0.0):
     """
-    Wrapper that supports both:
-      - openai>=1.0.0 (OpenAI client): client.chat.completions.create(...)
-      - openai<1.0.0: openai.ChatCompletion.create(...)
-    Returns tuple (text, resp). Raises exceptions from underlying client on failure.
+    Robust wrapper to get chat completions:
+      1) Try new openai.OpenAI client (openai>=1.x)
+      2) Fallback: use direct REST POST to /v1/chat/completions using OPENAI_API_KEY
+    Returns (text, raw_response). Raises RuntimeError if neither path is possible.
     """
     model = model or OPENAI_MODEL
 
-    if openai is None:
-        raise RuntimeError("openai package not installed")
-
-    # Try new API (openai.OpenAI client)
-    try:
-        OpenAI = getattr(openai, "OpenAI", None)
-        if OpenAI:
-            # instantiate client with key if provided
-            client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            # attempt to extract text from new response shape
-            try:
-                text = resp.choices[0].message.content
-            except Exception:
-                # fallback to dict-like access
+    # If openai package is present, prefer using its modern client
+    if openai is not None:
+        try:
+            OpenAI = getattr(openai, "OpenAI", None)
+            if OpenAI:
+                client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                # Try to extract assistant text in common shapes
                 try:
-                    text = resp["choices"][0]["message"]["content"]
+                    text = resp.choices[0].message.content
                 except Exception:
-                    text = str(resp)
-            return text, resp
-    except Exception:
-        # fall through to older API attempt
-        pass
+                    try:
+                        text = resp["choices"][0]["message"]["content"]
+                    except Exception:
+                        text = str(resp)
+                return text, resp
+        except Exception:
+            # If the new client failed, we'll attempt REST fallback below
+            pass
 
-    # Fallback to older API
+    # REST fallback using direct HTTP call to OpenAI API
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not available for REST fallback. Set OPENAI_API_KEY in st.secrets or env.")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Try requests first (optional), else use urllib
     try:
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        text = resp["choices"][0]["message"]["content"]
-        return text, resp
+        import requests
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r.raise_for_status()
+        j = r.json()
     except Exception:
-        # re-raise to allow caller to handle/log
-        raise
+        try:
+            import urllib.request, ssl
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as fh:
+                j = json.load(fh)
+        except Exception as e:
+            raise RuntimeError(f"REST call to OpenAI failed: {e}")
+
+    try:
+        text = j["choices"][0]["message"]["content"]
+    except Exception:
+        text = json.dumps(j)[:2000]
+    return text, j
+# --- end create_chat_completion ---
+
 
 # --- Debug-knap til at teste OpenAI‑forbindelsen direkte fra UI (fjern efter brug) ---
 def openai_debug_test():
@@ -137,10 +163,9 @@ def openai_debug_test():
                     st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj den i .streamlit/secrets.toml eller i din host's env.")
                     return
                 if openai is None:
-                    st.error("openai-pakken er ikke installeret i dette miljø.")
-                    return
+                    # still ok because REST fallback can work; we'll try wrapper anyway
+                    st.sidebar.write("openai-pakken ikke installeret, prøver REST-fallback via API-key.")
 
-                # Build simple test message
                 messages = [{"role": "user", "content": "Ping"}]
                 try:
                     text, resp = create_chat_completion(messages, model="gpt-3.5-turbo", max_tokens=1, temperature=0.0)
@@ -151,7 +176,6 @@ def openai_debug_test():
                     return
 
                 st.success("OpenAI test OK — modtog svar.")
-                # try to show non-sensitive resp info
                 try:
                     if isinstance(resp, dict):
                         keys = list(resp.keys())
@@ -165,8 +189,11 @@ def openai_debug_test():
                 tb = traceback.format_exc()
                 st.sidebar.text_area("Traceback (debug)", value=tb, height=300)
 
+
 # Kald debug knap (fjern denne linje efter du har debugget)
 openai_debug_test()
+# --- end debug ---
+
 
 # --- App helper functions (embeddings, matching, etc.) ---
 @st.cache_data(ttl=120)
@@ -286,7 +313,7 @@ def keyword_boost_for_row(row, incoming_text):
 
 # Updated call_openai_slot_extractor to use compatibility wrapper
 def call_openai_slot_extractor(mail_text, candidate_rows):
-    if openai is None or not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and openai is None:
         return None
     ctx = []
     for r in candidate_rows:
@@ -329,7 +356,7 @@ def generate_draft_reply(mail_text, top_candidates, templates_dict, openai_model
     Returnerer dict med keys: subject, body, confidence, notes
     top_candidates: liste af tuples (row, sim, matched_count, spec, combined)
     """
-    if openai is None or not OPENAI_API_KEY:
+    if not OPENAI_API_KEY and openai is None:
         return None
 
     ctx_lines = []
@@ -370,6 +397,7 @@ def generate_draft_reply(mail_text, top_candidates, templates_dict, openai_model
     except Exception as e:
         return {"subject": "", "body": f"Fejl ved opkald til OpenAI: {e}", "confidence": 0.0, "notes": "OpenAI-fejl"}
 
+# Matching and main flow
 def choose_best_by_semantic(rows, embs, query_emb, incoming_text):
     if embs is None or query_emb is None:
         return []
@@ -457,7 +485,7 @@ else:
     if best_sim >= HIGH_THRESHOLD and str(best_row.get("exclude_flag","")).lower() not in ("true","1","yes"):
         decision = "auto_accept"
     elif best_sim >= MID_THRESHOLD:
-        decision = "confirm_with_llm" if (use_openai_checkbox and OPENAI_API_KEY and openai is not None) else "manual_review"
+        decision = "confirm_with_llm" if (use_openai_checkbox and OPENAI_API_KEY and (openai is not None or OPENAI_API_KEY)) else "manual_review"
     else:
         decision = "manual_review"
 
@@ -491,7 +519,7 @@ else:
     if take_row is None:
         st.warning("Ingen automatisk kandidat blev accepteret. Genererer forslag til manuel review...")
         draft = None
-        if OPENAI_API_KEY and openai is not None:
+        if (OPENAI_API_KEY or openai is not None):
             try:
                 draft = generate_draft_reply(combined, topk, templates)
             except Exception as e:
