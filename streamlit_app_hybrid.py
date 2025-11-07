@@ -1,7 +1,7 @@
 """
 Hybrid Streamlit prototype:
 - sentence-transformers local embeddings for semantic search
-- OpenAI ChatCompletion for slot extraction/confirmation
+- OpenAI ChatCompletion for draft generation and slot extraction/confirmation
 Place this file in repo root as streamlit_app_hybrid.py.
 """
 import os
@@ -213,6 +213,58 @@ def call_openai_slot_extractor(mail_text, candidate_rows):
         st.error(f"OpenAI call failed: {e}")
         return None
 
+# --- Ny funktion: generer draft reply via OpenAI ---
+def generate_draft_reply(mail_text, top_candidates, templates_dict, openai_model=OPENAI_MODEL):
+    """
+    Returnerer dict med keys: subject, body, confidence, notes
+    top_candidates: liste af tuples (row, sim, matched_count, spec, combined)
+    """
+    if openai is None or not OPENAI_API_KEY:
+        return None
+
+    ctx_lines = []
+    for c in top_candidates[:4]:
+        row = c[0] if isinstance(c, (list, tuple)) else c
+        ctx_lines.append(f"- id:{row.get('id','')}, path:{row.get('path','')}, topic:{row.get('topic','')}, url:{row.get('requirements_url','')}")
+    ctx_text = "\n".join(ctx_lines)
+
+    system = (
+        "Du er en hjælpsom assistent der skriver et kort, professionelt svar på en studenterhenvendelse. "
+        "Returner KUN et JSON‑objekt med felterne: subject, body, confidence (0-1), notes.\n"
+        "Body skal være venlig, kortfattet og indeholde link(e) hvis relevante.\n"
+        "Angiv ikke interne systemnavne; referer til links og konkrete næste trin for ansøgeren."
+    )
+
+    user = (
+        f"Mail content:\n'''{mail_text}'''\n\n"
+        f"Top candidate contexts:\n{ctx_text}\n\n"
+        "Skriv et forslag til SUBJECT (max 80 chars) og BODY (kort, max ~250-400 words) som en JSON objekt.\n"
+        "BODY må gerne indeholde: 1) Tak for henvendelsen, 2) det vigtigste svar eller link, 3) konkret næste skridt for ansøgeren, 4) kontaktinfo hvis nødvendigt.\n"
+        "Returner kun et JSON‑objekt (ingen ekstra tekst)."
+    )
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=openai_model,
+            messages=[{"role":"system","content":system}, {"role":"user","content":user}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        out = resp["choices"][0]["message"]["content"].strip()
+        try:
+            parsed = json.loads(out)
+            return parsed
+        except Exception:
+            m = re.search(r'(\{[\s\S]*\})', out)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    return {"subject": "", "body": out, "confidence": 0.0, "notes": "Kunne ikke parse fuld JSON; se body."}
+            return {"subject": "", "body": out, "confidence": 0.0, "notes": "Ingen JSON fundet i modeloutput."}
+    except Exception as e:
+        return {"subject": "", "body": f"Fejl ved opkald til OpenAI: {e}", "confidence": 0.0, "notes": "OpenAI-fejl"}
+
 def choose_best_by_semantic(rows, embs, query_emb, incoming_text):
     if embs is None or query_emb is None:
         return []
@@ -330,10 +382,47 @@ else:
             st.warning("LLM confirmation did not match candidate sufficiently -> manual review recommended.")
             take_row = None
 
+    # Hvis der ikke er en automatisk valgt række: generer udkast til manuel review
     if take_row is None:
-        st.error("Ingen automatisk svar genereres — sæt til manuel review eller tilkald en medarbejder.")
+        st.warning("Ingen automatisk kandidat blev accepteret. Genererer forslag til manuel review...")
+        draft = None
+        if OPENAI_API_KEY and openai is not None:
+            try:
+                draft = generate_draft_reply(combined, topk, templates)
+            except Exception as e:
+                st.error(f"Generering af udkast fejlede: {e}")
+                draft = None
+
+        if draft:
+            st.markdown("### Forslag (auto‑genereret udkast — rediger før afsendelse)")
+            subj_suggestion = draft.get("subject", "") or f"Vedr. din henvendelse"
+            body_suggestion = draft.get("body", "") or ""
+            manual_subj = st.text_input("Suggested subject (edit before sending):", value=subj_suggestion, key="manual_subj")
+            manual_body = st.text_area("Suggested body (edit before sending):", value=body_suggestion, height=300, key="manual_body")
+            st.markdown(f"**Confidence:** {draft.get('confidence', 0):.2f}")
+            if draft.get("notes"):
+                st.info(f"Notes: {draft.get('notes')}")
+            st.success("Rediger forslaget og kopier/brug det i din mailklient. App'en sender ikke automatisk.")
+        else:
+            # fallback tekst hvis OpenAI ikke er tilgængelig eller fejlede
+            st.info("OpenAI ikke tilgængelig eller fejl i opkald. Viser generisk fallback‑forslag.")
+            fallback_lines = []
+            for r, sim, mc, spec, comb in topk[:3]:
+                url = r.get("requirements_url","")
+                topic = r.get("topic","ukendt")
+                fallback_lines.append(f"- {topic}: {url or 'ingen URL tilgængelig'}")
+            fallback_body = (
+                "Kære ansøger,\n\n"
+                "Tak for din henvendelse. Se venligst følgende oplysninger og links, som kan være relevante:\n\n"
+                + "\n".join(fallback_lines) +
+                "\n\nHvis du har brug for yderligere hjælp, svar venligst på denne mail.\n\nMed venlig hilsen\nStudiekontoret"
+            )
+            fallback_subj = "Vedr. din henvendelse"
+            st.text_input("Suggested subject (edit):", value=fallback_subj, key="fallback_subj")
+            st.text_area("Suggested body (edit):", value=fallback_body, height=300, key="fallback_body")
         st.stop()
 
+    # Fortsæt hvis take_row er valgt (auto_accept eller confirmed)
     tpl_id = take_row.get("response_template_id","")
     tpl_meta = templates.get(tpl_id)
     if not tpl_meta:
@@ -389,4 +478,4 @@ else:
     })
 
 st.write("---")
-st.caption("Hybrid prototype: sentence-transformers local embeddings + OpenAI LLM for slot extraction/confirmation.")
+st.caption("Hybrid prototype: sentence-transformers local embeddings + OpenAI LLM for draft generation/slot extraction. Husk at sætte OPENAI_API_KEY i miljøet.")
