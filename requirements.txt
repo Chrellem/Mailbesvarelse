@@ -6,5 +6,6 @@ streamlit
 jinja2
 python-dotenv
 openai
+openpyxl
+requests
 pytest
-pip install openpyxl
