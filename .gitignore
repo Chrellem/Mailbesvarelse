@@ -12,3 +12,4 @@ venv/
 .idea/
 # secrets / service account keys (ALDRIG commit)
 *.json
+.streamlit/secrets.toml
