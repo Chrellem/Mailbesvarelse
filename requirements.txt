@@ -7,3 +7,4 @@ jinja2
 python-dotenv
 openai
 pytest
+pip install openpyxl
