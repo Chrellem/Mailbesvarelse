@@ -310,6 +310,33 @@ def generate_combined_reply(mail_text: str,
     # fallback: return text as body
     return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Kunne ikke parse JSON fra model; se body"}
 
+# --- START: select_program_rows helper (tilføj hvis mangler) ---
+def select_program_rows(programme_name_or_id: str, programs_kb: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    """
+    Return rows matching programme name or ID (case-insensitive).
+    Tries exact match first, ellers partial contains fallback.
+    """
+    if not programme_name_or_id or not programs_kb:
+        return []
+    target = str(programme_name_or_id).strip().lower()
+    matches = []
+    try:
+        # exact matches on programme or id
+        matches = [r for r in programs_kb
+                   if (str(r.get("programme","")).strip().lower() == target)
+                   or (str(r.get("id","")).strip().lower() == target)]
+        # fallback to partial contains
+        if not matches:
+            matches = [r for r in programs_kb
+                       if target in str(r.get("programme","")).strip().lower()
+                       or target in str(r.get("id","")).strip().lower()]
+    except Exception:
+        # Defensive: if KB rows have unexpected structure, return empty list
+        return []
+    return matches
+# --- END: select_program_rows helper ---
+
+
 # ---------------- UI / main flow ----------------
 programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS_KB_DEFAULT))
 faq_kb = load_faq_kb(st.session_state.get("faq_kb_path", FAQ_KB_DEFAULT))
