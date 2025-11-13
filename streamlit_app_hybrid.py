@@ -3,15 +3,10 @@ streamlit_app_hybrid.py
 
 KB-first prototype (Programmes.xlsx)
 - Loads Programmes.xlsx (sheets/Programmes.xlsx) with columns: ID, Programme, Admission requiements
-- Detects which programme a mail concerns and restricts GenAI to that programme's admission text (KB-only mode)
+- Automatically detects programme from mail text and uses that programme's admission text as KB (KB-only)
 - Robust OpenAI wrapper: tries openai.OpenAI client (v1+), otherwise REST fallback using OPENAI_API_KEY
 - Debug button in sidebar to verify OpenAI connectivity
 - Generates editable draft replies constrained to KB when requested
-
-Instructions:
-- Place Programmes.xlsx under sheets/ (or update programs_kb_path in sidebar)
-- Ensure openpyxl is installed (add "openpyxl" to requirements.txt)
-- Set OPENAI_API_KEY either in Streamlit Secrets or as an environment variable
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -393,12 +388,11 @@ def generate_draft_reply(mail_text: str,
         ctx_lines.append(f"- id:{row.get('id','')}, path:{row.get('path','')}, topic:{row.get('topic','')}, url:{row.get('requirements_url','')}")
     ctx_text = "\n".join(ctx_lines)
 
-    # If KB-only and excel_kb present, prepare KB block (admission text)
+    # If KB-only and excel_kb present, prepare KB block (admission text or answer)
     kb_block = ""
     if kb_only and excel_kb:
         kb_lines = []
         for r in excel_kb[:8]:
-            # If program rows (programme/admission), use those fields; else fall back to question/answer
             if "admission" in r:
                 admission_text = (r.get("admission") or "").strip()
                 prog = (r.get("programme") or r.get("question") or "").strip()
@@ -511,59 +505,54 @@ with st.form("email_form"):
     subject = st.text_input("Subject", value="")
     body = st.text_area("Body", value="", height=200)
     applicant_name = st.text_input("Applicant name (valgfri)", value="")
-    program_manual = st.text_input("Manuelt valgt program (valgfri)", value="")
+    # free text manual override inside form
+    st.text_input("Manuelt valgt program (valgfri)", value="", key="program_manual_input")
     use_openai_checkbox = st.checkbox("Use OpenAI for slot extraction / draft", value=bool(OPENAI_API_KEY))
     submitted = st.form_submit_button("Preview svar")
 if not submitted:
     st.info("Indtast subject/body og klik Preview.")
 else:
     combined = f"{subject}\n\n{body}"
-    # store last mail text for sidebar/other flows
+    # store last mail text for other flows
     st.session_state["last_mail_text"] = combined
 
-    # Program detection + simple UI
+    # ---------- Program detection & auto-selection ----------
     program_rows = None
-    selected_program_meta = st.session_state.get("selected_program", None)
+
+    # Manual free-text override from form (if user filled it)
+    program_manual = st.session_state.get("program_manual_input", "") or None
 
     if programs_kb:
         candidates = detect_program_from_mail_simple(combined, programs_kb, top_n=4)
     else:
         candidates = []
 
-    if candidates:
-        st.markdown("**Foreslåede programmer (auto-detekteret):**")
-        for i, (row, score) in enumerate(candidates, start=1):
-            st.write(f"{i}. {row.get('programme')}  (score {score:.1f})")
-        # radio choices
-        options = [f"{i+1}: {candidates[i][0].get('programme')}" for i in range(len(candidates))]
-        options.append("Ingen af disse")
-        pick_idx = st.radio("Vælg kandidat (eller Ingen):", options=options, index=0, key="program_pick")
-        if pick_idx != "Ingen af disse":
-            idx = int(pick_idx.split(":")[0]) - 1
-            chosen = candidates[idx][0]
-            st.markdown(f"**Foreslået program valgt:** {chosen.get('programme')}")
-            if st.button("Bekræft valgt program"):
-                st.session_state["selected_program"] = {"programme": chosen.get("programme"), "rows": select_program_rows(chosen.get("programme"), programs_kb)}
-                st.success("Program gemt som valgt.")
+    # Auto-select top candidate if found and no manual override
+    if program_manual:
+        # user provided manual program within form -> use it
+        st.session_state["selected_program"] = {"programme": program_manual, "rows": select_program_rows(program_manual, programs_kb)}
+    elif candidates:
+        top_row, top_score = candidates[0]
+        # always auto-set the selected_program to top candidate (no confirmation required)
+        st.session_state["selected_program"] = {"programme": top_row.get("programme"), "rows": select_program_rows(top_row.get("programme"), programs_kb)}
+        st.markdown(f"**Foreslået program (auto‑valgt):** {top_row.get('programme')}  (score {top_score:.1f})")
     else:
+        # no candidate found -> do nothing (user can manual select further down)
         st.info("Ingen tydelige program‑matches i Programmes.xlsx.")
 
-    # manual override
+    # Manual override selectbox outside form (persistent)
     all_programs = sorted({(p.get("programme") or "") for p in programs_kb if p.get("programme")})
     manual_choice = st.selectbox("Eller vælg manuelt et program fra KB (valgfrit):", options=[""] + all_programs, key="manual_program_choice")
     if manual_choice:
         st.session_state["selected_program"] = {"programme": manual_choice, "rows": select_program_rows(manual_choice, programs_kb)}
         st.success(f"Manuelt valgt program: {manual_choice}")
 
-    if program_manual:
-        st.session_state["selected_program"] = {"programme": program_manual, "rows": select_program_rows(program_manual, programs_kb)}
-        st.success(f"Program gemt fra manuelt felt: {program_manual}")
-
+    # Obtain program_rows for generator
     if st.session_state.get("selected_program"):
         program_rows = st.session_state["selected_program"].get("rows", None)
         st.markdown(f"**Aktuelt valgt program:** {st.session_state['selected_program'].get('programme')} (rækker: {len(program_rows) if program_rows else 0})")
 
-    # simple semantic candidate flow from requirements CSV if SentenceTransformer available
+    # ---------- Minimal semantic matching for requirements CSV (optional) ----------
     topk = []
     if model is not None and not req_df.empty:
         try:
@@ -581,16 +570,14 @@ else:
     else:
         topk = []
 
-    # Now generate draft. If a program is selected, pass its rows to generator and enforce kb_only=True
+    # ---------- Generate draft (uses program_rows if present) ----------
     st.markdown("### Genereret forslag (manual / preview)")
     try:
         draft = None
         if use_openai_checkbox and (OPENAI_API_KEY or openai is not None):
             if program_rows:
-                # program_rows is a list of rows with 'admission' field
                 draft = generate_draft_reply(combined, topk, templates, openai_model=OPENAI_MODEL, excel_kb=program_rows, kb_only=True)
             else:
-                # fallback: use global excel_kb if configured and use_excel_kb_only flag
                 excel_kb_global = load_excel_kb(st.session_state.get("excel_kb_path", EXCEL_KB_PATH))
                 draft = generate_draft_reply(combined, topk, templates, openai_model=OPENAI_MODEL, excel_kb=excel_kb_global, kb_only=use_excel_kb_only)
         else:
@@ -607,7 +594,7 @@ else:
                 st.info(f"Notes: {draft.get('notes')}")
             st.success("Rediger forslaget og kopier/brug det i din mailklient. App'en sender ikke automatisk.")
         else:
-            # Fallback: show KB-based snippets if program selected or KB-only selected
+            # Fallback: show program KB snippets if program selected or KB-only selected
             if program_rows:
                 lines = []
                 for r in program_rows[:4]:
