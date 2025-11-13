@@ -1,24 +1,25 @@
 """
-Hybrid Streamlit prototype (KB-first variant)
+streamlit_app_hybrid.py
 
-- Loads an Excel knowledge base (xlsx) with columns: ID, Question, Answer
-- If "KB-only" is enabled, the model is instructed to use ONLY the KB content when answering.
-- Robust OpenAI wrapper: tries openai.OpenAI client (v1+), otherwise REST fallback using OPENAI_API_KEY.
-- Debug button in the sidebar to verify OpenAI connectivity.
-- When decision leads to manual review, an editable draft is produced (based on KB if KB-only is set).
+KB-first prototype (Programmes.xlsx)
+- Loads Programmes.xlsx (sheets/Programmes.xlsx) with columns: ID, Programme, Admission requiements
+- Detects which programme a mail concerns and restricts GenAI to that programme's admission text (KB-only mode)
+- Robust OpenAI wrapper: tries openai.OpenAI client (v1+), otherwise REST fallback using OPENAI_API_KEY
+- Debug button in sidebar to verify OpenAI connectivity
+- Generates editable draft replies constrained to KB when requested
 
-Place this file in repo root as streamlit_app_hybrid.py and run:
-  streamlit run streamlit_app_hybrid.py
-
-Make sure to set OPENAI_API_KEY via Streamlit Secrets or environment variable.
+Instructions:
+- Place Programmes.xlsx under sheets/ (or update programs_kb_path in sidebar)
+- Ensure openpyxl is installed (add "openpyxl" to requirements.txt)
+- Set OPENAI_API_KEY either in Streamlit Secrets or as an environment variable
 """
+from typing import List, Dict, Any, Tuple
 import os
 import re
 import json
-import traceback
 import ssl
 import urllib.request
-from typing import List, Tuple, Dict, Any
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -26,13 +27,13 @@ import streamlit as st
 from jinja2 import Template
 from dotenv import load_dotenv
 
-# Optional local embeddings
+# Optional local embeddings (kept minimal for prototype)
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
     SentenceTransformer = None
 
-# Try import openai (may be v0.x or v1.x); ok if missing (we have REST fallback)
+# Try import openai (may be absent or v0.x/v1.x). We have REST fallback.
 try:
     import openai
 except Exception:
@@ -40,16 +41,14 @@ except Exception:
 
 load_dotenv()
 
-# ---------- Configuration ----------
+# ---------------- Configuration ----------------
 REQUIREMENTS_CSV = os.getenv("REQUIREMENTS_CSV", "sheets/requirements_suggestions.csv")
 TEMPLATES_CSV = os.getenv("TEMPLATES_CSV", "sheets/templates_suggestions.csv")
-
-# Excel KB defaults (user said KB has 3 columns: ID, Question, Answer)
 EXCEL_KB_PATH = os.getenv("EXCEL_KB_PATH", "sheets/faq_kb.xlsx")
+PROGRAMS_KB_PATH = os.getenv("PROGRAMS_KB_PATH", "sheets/Programmes.xlsx")
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
-TEST_MODE = os.getenv("TEST_MODE", "true").lower() in ("1", "true", "yes")
 
 HIGH_THRESHOLD = float(os.getenv("HIGH_SIM_THRESHOLD", "0.80"))
 MID_THRESHOLD = float(os.getenv("MID_SIM_THRESHOLD", "0.65"))
@@ -59,16 +58,16 @@ SPECIFICITY_BOOST = float(os.getenv("SPECIFICITY_BOOST", "0.01"))
 st.set_page_config(page_title="Mail‑besvarelse (KB-first)", layout="wide")
 st.title("Mail‑besvarelse Prototype — KB‑first")
 
-# ---------- Sidebar / Secrets ----------
+# ---------------- Sidebar / Secrets ----------------
 st.sidebar.header("Konfiguration")
-
 st.sidebar.text_input("Requirements CSV", value=REQUIREMENTS_CSV, key="req_path")
 st.sidebar.text_input("Templates CSV", value=TEMPLATES_CSV, key="tpl_path")
-st.sidebar.text_input("Excel KB path (xlsx)", value=EXCEL_KB_PATH, key="excel_kb_path")
+st.sidebar.text_input("Excel KB path (faq KB)", value=EXCEL_KB_PATH, key="excel_kb_path")
+st.sidebar.text_input("Programmes KB path", value=PROGRAMS_KB_PATH, key="programs_kb_path")
 use_excel_kb_only = st.sidebar.checkbox("Begræns model til kun Excel KB (KB-only)", value=True, key="use_excel_kb_only")
 st.sidebar.text_input("OpenAI model", value=OPENAI_MODEL, key="openai_model")
 
-# Read OPENAI key from st.secrets (Streamlit) or environment (.env)
+# Read OPENAI key from st.secrets or environment
 OPENAI_API_KEY = None
 try:
     if isinstance(st.secrets, dict) and "OPENAI_API_KEY" in st.secrets:
@@ -78,22 +77,19 @@ try:
 except Exception:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# sanitize/trim
 if OPENAI_API_KEY:
     OPENAI_API_KEY = OPENAI_API_KEY.strip()
 
-# Show only presence / safe info
 st.sidebar.write("OPENAI API key tilgængelig:", bool(OPENAI_API_KEY))
 st.sidebar.write("OPENAI API key length (safe):", len(OPENAI_API_KEY) if OPENAI_API_KEY else 0)
 
-# If openai module exists, try to set openai.api_key for backwards compat where relevant
 if openai is not None and OPENAI_API_KEY:
     try:
         openai.api_key = OPENAI_API_KEY
     except Exception:
         pass
 
-# ---------- OpenAI compatibility + REST fallback ----------
+# ---------------- OpenAI compatibility + REST fallback ----------------
 def create_chat_completion(messages: List[Dict[str, str]],
                            model: str = None,
                            max_tokens: int = 400,
@@ -101,13 +97,13 @@ def create_chat_completion(messages: List[Dict[str, str]],
     """
     Returns (text, raw_response).
     Strategy:
-      1) If openai.OpenAI client is present (v1+), use client.chat.completions.create(...)
-      2) Else use REST POST to https://api.openai.com/v1/chat/completions with OPENAI_API_KEY
+      1) If openai.OpenAI client present, use client.chat.completions.create(...)
+      2) Otherwise REST POST to /v1/chat/completions using OPENAI_API_KEY
     Raises RuntimeError on missing credentials or network/HTTP failure.
     """
     model = model or OPENAI_MODEL
 
-    # Try new client if available
+    # Try new OpenAI client if available
     if openai is not None:
         try:
             OpenAI = getattr(openai, "OpenAI", None)
@@ -119,7 +115,6 @@ def create_chat_completion(messages: List[Dict[str, str]],
                     max_tokens=max_tokens,
                     temperature=temperature
                 )
-                # Try to extract assistant text
                 try:
                     text = resp.choices[0].message.content
                 except Exception:
@@ -129,12 +124,12 @@ def create_chat_completion(messages: List[Dict[str, str]],
                         text = str(resp)
                 return text, resp
         except Exception:
-            # proceed to REST fallback
+            # fallthrough to REST fallback
             pass
 
     # REST fallback
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not available for REST fallback. Please set the key in st.secrets or env.")
+        raise RuntimeError("OPENAI_API_KEY not available for REST fallback. Set OPENAI_API_KEY in st.secrets or env.")
 
     url = "https://api.openai.com/v1/chat/completions"
     payload = {
@@ -148,7 +143,7 @@ def create_chat_completion(messages: List[Dict[str, str]],
         "Content-Type": "application/json"
     }
 
-    # Try requests if available
+    # requests if available
     try:
         import requests
         r = requests.post(url, headers=headers, json=payload, timeout=20)
@@ -171,7 +166,7 @@ def create_chat_completion(messages: List[Dict[str, str]],
         text = json.dumps(j)[:2000]
     return text, j
 
-# ---------- Debug button ----------
+# ---------------- Debug button ----------------
 def openai_debug_test():
     st.sidebar.markdown("### Debug: OpenAI connection")
     if st.sidebar.button("Test OpenAI connection"):
@@ -179,7 +174,7 @@ def openai_debug_test():
             try:
                 st.sidebar.write("OPENAI_API_KEY set:", bool(OPENAI_API_KEY))
                 if not OPENAI_API_KEY:
-                    st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj den i .streamlit/secrets.toml eller som env.")
+                    st.error("OPENAI_API_KEY ikke sat i dette miljø. Tilføj i st.secrets eller env.")
                     return
                 messages = [{"role": "user", "content": "Ping"}]
                 try:
@@ -205,35 +200,44 @@ def openai_debug_test():
 
 openai_debug_test()
 
-# ---------- KB loading & scoring ----------
+# ---------------- KB loaders & program helpers ----------------
 @st.cache_data(ttl=300)
 def load_excel_kb(path: str) -> List[Dict[str, str]]:
-    """
-    Load Excel KB. Expects columns (case-insensitive): id, question, answer.
-    Returns list of dict rows.
-    """
+    """Load a generic KB xlsx/csv (ID, Question, Answer) - falls back to CSV if openpyxl missing."""
     if not os.path.exists(path):
         return []
     try:
-        df = pd.read_excel(path, sheet_name=0, dtype=str).fillna("")
+        if path.lower().endswith(".xlsx"):
+            df = pd.read_excel(path, sheet_name=0, dtype=str, engine="openpyxl").fillna("")
+        else:
+            df = pd.read_csv(path, dtype=str).fillna("")
     except Exception as e:
+        # fallback csv
+        base, _ = os.path.splitext(path)
+        csv_path = base + ".csv"
         st.error(f"Fejl ved indlæsning af Excel KB '{path}': {e}")
-        return []
-    # normalize columns to lowercase
+        if os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path, dtype=str).fillna("")
+                st.info(f"Bruger fallback CSV: {csv_path}")
+            except Exception as e2:
+                st.error(f"Fallback til CSV fejlede: {e2}")
+                return []
+        else:
+            return []
     df.columns = [c.strip().lower() for c in df.columns]
-    # Attempt to map common names
+    # Map to id/question/answer
     id_col = None
     q_col = None
     a_col = None
-    for c in df.columns:
-        if c in ("id", "identifier"):
-            id_col = c
-        if c.startswith("q") or "question" in c:
-            q_col = c
-        if c.startswith("a") or "answer" in c or "svar" in c:
-            a_col = c
-    # fallback to first 3 columns
     cols = list(df.columns)
+    for c in df.columns:
+        if c in ("id",):
+            id_col = c
+        if "question" in c or c.startswith("q"):
+            q_col = c
+        if "answer" in c or "svar" in c or c.startswith("a"):
+            a_col = c
     if id_col is None and len(cols) >= 1:
         id_col = cols[0]
     if q_col is None and len(cols) >= 2:
@@ -243,36 +247,84 @@ def load_excel_kb(path: str) -> List[Dict[str, str]]:
     out = []
     for _, r in df.iterrows():
         out.append({
-            "id": str(r.get(id_col, "")).strip(),
-            "question": str(r.get(q_col, "")).strip(),
-            "answer": str(r.get(a_col, "")).strip()
+            "id": str(r.get(id_col, "")).strip() if id_col else "",
+            "question": str(r.get(q_col, "")).strip() if q_col else "",
+            "answer": str(r.get(a_col, "")).strip() if a_col else ""
         })
     return out
 
-def score_kb_rows(kb_rows: List[Dict[str, str]], incoming_text: str) -> List[Dict[str, str]]:
+@st.cache_data(ttl=300)
+def load_programs_kb(path: str) -> List[Dict[str, str]]:
     """
-    Simple token/substring based scoring. Returns rows sorted by descending relevance.
+    Load Programmes.xlsx (columns: ID, Programme, Admission requiements).
+    Returns list of dicts with keys: id, programme, admission.
     """
-    t = (incoming_text or "").lower()
-    scored = []
-    for r in kb_rows:
-        combined = f"{r.get('question','')} {r.get('answer','')}".lower()
-        # count unique tokens from combined that appear in incoming text
-        tokens = set(re.findall(r'\w{3,}', combined))
-        matched = sum(1 for tok in tokens if tok in t)
-        # boost if question exact substring appears in incoming text
-        qtext = (r.get('question') or "").strip().lower()
-        if qtext and qtext in t:
-            matched += 5
-        scored.append((r, matched))
-    scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
-    # return only items with positive score first; if none positive return top N
-    positives = [r for r, s in scored_sorted if s > 0]
-    if positives:
-        return positives
-    return [r for r, s in scored_sorted][:6]
+    if not os.path.exists(path):
+        return []
+    try:
+        if path.lower().endswith(".xlsx"):
+            df = pd.read_excel(path, sheet_name=0, dtype=str, engine="openpyxl").fillna("")
+        else:
+            df = pd.read_csv(path, dtype=str).fillna("")
+    except Exception as e:
+        st.error(f"Fejl ved indlæsning af programs KB '{path}': {e}")
+        return []
+    df.columns = [c.strip().lower() for c in df.columns]
+    colmap = {c: orig for c, orig in zip(df.columns, df.columns)}
+    # find best columns
+    id_col = colmap.get("id") or (df.columns[0] if len(df.columns) >= 1 else None)
+    prog_col = colmap.get("programme") or colmap.get("program") or (df.columns[1] if len(df.columns) >= 2 else None)
+    admission_col = None
+    for lc, orig in zip(df.columns, df.columns):
+        if "admiss" in lc or "requi" in lc or "require" in lc:
+            admission_col = orig
+            break
+    if not admission_col and len(df.columns) >= 3:
+        admission_col = df.columns[2]
+    out = []
+    for _, r in df.iterrows():
+        out.append({
+            "id": str(r.get(id_col, "")).strip() if id_col else "",
+            "programme": str(r.get(prog_col, "")).strip() if prog_col else "",
+            "admission": str(r.get(admission_col, "")).strip() if admission_col else ""
+        })
+    return out
 
-# ---------- (Minimal) other helper functions used in matching flow ----------
+def detect_program_from_mail_simple(mail_text: str, programs_kb: List[Dict[str,str]], top_n: int = 3) -> List[Tuple[Dict[str,str], float]]:
+    """Simple token/substr based detection. Returns list of (row, score)."""
+    t = (mail_text or "").lower()
+    if not t or not programs_kb:
+        return []
+    scored = []
+    for r in programs_kb:
+        pname = (r.get("programme") or "").lower()
+        if not pname:
+            continue
+        score = 0.0
+        if pname in t:
+            score += 6.0
+        tokens = set(re.findall(r'\w{3,}', pname))
+        score += sum(1.0 for tok in tokens if tok in t)
+        adm = (r.get("admission") or "").lower()
+        if adm:
+            adm_tokens = set(re.findall(r'\w{4,}', adm))
+            score += sum(0.5 for tok in adm_tokens if tok in t)
+        if score > 0:
+            scored.append((r, float(score)))
+    scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
+    return scored_sorted[:top_n]
+
+def select_program_rows(programme_name_or_id: str, programs_kb: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    """Return rows matching programme name or ID (case-insensitive)."""
+    if not programme_name_or_id or not programs_kb:
+        return []
+    target = programme_name_or_id.strip().lower()
+    matches = [r for r in programs_kb if (r.get("programme","").strip().lower() == target) or (r.get("id","").strip().lower() == target)]
+    if not matches:
+        matches = [r for r in programs_kb if target in (r.get("programme","").strip().lower()) or target in (r.get("id","").strip().lower())]
+    return matches
+
+# ---------------- Minimal helper functions reused ----------------
 def embed_texts(model, texts):
     if model is None:
         return None
@@ -283,27 +335,12 @@ def cosine_sim(a, b):
         return np.array([])
     return np.dot(b, a)
 
-def split_keywords(cell):
-    return [k.strip().lower() for k in (cell or "").split(",") if k.strip()]
-
-def keyword_matches_text(text, kw):
-    if not kw:
-        return False
-    try:
-        return re.search(r'(?i)\b' + re.escape(kw) + r'\b', text) is not None
-    except re.error:
-        return kw in text
-
-def path_specificity(path):
-    toks = (path or "").split("/")
-    return sum(1 for t in toks if t and t != "*")
-
-# ---------- OpenAI-based extractors and draft generation (use wrapper) ----------
-def call_openai_slot_extractor(mail_text: str, candidate_rows: List[Dict[str, str]]):
+# ---------------- OpenAI-based extractors & draft generation ----------------
+def call_openai_slot_extractor(mail_text: str, candidate_rows: List[Dict[str,str]]):
     if not OPENAI_API_KEY and openai is None:
         return None
     ctx = []
-    for r in candidate_rows:
+    for r in candidate_rows or []:
         ctx.append({
             "id": r.get("id", ""),
             "path": r.get("path", ""),
@@ -337,15 +374,15 @@ def call_openai_slot_extractor(mail_text: str, candidate_rows: List[Dict[str, st
         return None
 
 def generate_draft_reply(mail_text: str,
-                         top_candidates: List[Tuple[Dict[str, str], float]],
+                         top_candidates: List[Any],
                          templates_dict: Dict[str, Any],
                          openai_model: str = OPENAI_MODEL,
-                         excel_kb: List[Dict[str, str]] = None,
+                         excel_kb: List[Dict[str,str]] = None,
                          kb_only: bool = False) -> Dict[str, Any]:
     """
     Generate a suggested reply.
-    If kb_only==True and excel_kb present, instruct model to use ONLY KB content.
-    Returns dict with keys: subject, body, confidence, notes
+    If kb_only==True and excel_kb present, instruct model to use ONLY KB content (admission text).
+    excel_kb: list of rows (each with 'id','programme','admission' or generic KB rows)
     """
     if not OPENAI_API_KEY and openai is None:
         return None
@@ -356,19 +393,22 @@ def generate_draft_reply(mail_text: str,
         ctx_lines.append(f"- id:{row.get('id','')}, path:{row.get('path','')}, topic:{row.get('topic','')}, url:{row.get('requirements_url','')}")
     ctx_text = "\n".join(ctx_lines)
 
+    # If KB-only and excel_kb present, prepare KB block (admission text)
     kb_block = ""
     if kb_only and excel_kb:
-        matched = score_kb_rows(excel_kb, mail_text)
-        if not matched:
-            matched = excel_kb[:6]
         kb_lines = []
-        for r in matched[:8]:
-            q = (r.get("question") or "").strip()
-            a = (r.get("answer") or "").strip()
-            # keep snippet length moderate
-            if len(a) > 600:
-                a = a[:600].rstrip() + " ..."
-            kb_lines.append(f"KB id:{r.get('id','')} | Q: {q} | A: {a}")
+        for r in excel_kb[:8]:
+            # If program rows (programme/admission), use those fields; else fall back to question/answer
+            if "admission" in r:
+                admission_text = (r.get("admission") or "").strip()
+                prog = (r.get("programme") or r.get("question") or "").strip()
+                snippet = admission_text if len(admission_text) <= 600 else admission_text[:600].rstrip() + " ..."
+                kb_lines.append(f"KB id:{r.get('id','')} | Programme: {prog} | Admission: {snippet}")
+            else:
+                a = (r.get("answer") or "").strip()
+                q = (r.get("question") or "").strip()
+                snippet = a if len(a) <= 600 else a[:600].rstrip() + " ..."
+                kb_lines.append(f"KB id:{r.get('id','')} | Q: {q} | A: {snippet}")
         kb_block = "\n".join(kb_lines)
 
     base_system = (
@@ -381,8 +421,7 @@ def generate_draft_reply(mail_text: str,
         kb_sys = (
             "VIGTIGT: Brug KUN informationen i de medfølgende KB-poster (nedenfor). "
             "Du må IKKE tilføje, antage eller opfinde information ud over hvad KB indeholder. "
-            "Hvis du ikke kan besvare spørgsmålet ud fra KB, returner subject empty and body: "
-            "'Jeg kender ikke svaret ud fra de tilgængelige oplysninger.'"
+            "Hvis du ikke kan besvare spørgsmålet ud fra KB, returner subject empty og body: 'Jeg kender ikke svaret ud fra de tilgængelige oplysninger.'"
         )
         messages.append({"role": "system", "content": kb_sys})
 
@@ -396,7 +435,7 @@ def generate_draft_reply(mail_text: str,
         user_text += f"Top candidate contexts:\n{ctx_text}\n\n"
     user_text += (
         "Skriv et forslag til SUBJECT (max 80 chars) og BODY (kort, ~100-400 words) som et JSON objekt med felterne: "
-        "subject, body, confidence, notes. BODY skal være venlig, indeholde references til KB entries hvis relevant."
+        "subject, body, confidence, notes. BODY skal være venlig og indeholde references til KB entries hvis relevant."
     )
     messages.append({"role": "user", "content": user_text})
 
@@ -404,7 +443,6 @@ def generate_draft_reply(mail_text: str,
         out_text, resp = create_chat_completion(messages, model=openai_model, max_tokens=600, temperature=0.2)
         try:
             parsed = json.loads(out_text)
-            # Ensure keys
             parsed.setdefault("subject", parsed.get("subject", "") or "")
             parsed.setdefault("body", parsed.get("body", "") or "")
             parsed.setdefault("confidence", float(parsed.get("confidence", 0) or 0))
@@ -422,7 +460,7 @@ def generate_draft_reply(mail_text: str,
     except Exception as e:
         return {"subject": "", "body": f"Fejl ved opkald til OpenAI: {e}", "confidence": 0.0, "notes": "OpenAI-fejl"}
 
-# ---------- Load other CSVs (optional) ----------
+# ---------------- Load other CSVs (optional) ----------------
 @st.cache_data(ttl=120)
 def load_requirements(path):
     if not os.path.exists(path):
@@ -443,21 +481,23 @@ def load_templates(path):
         df["allowed_path_patterns"] = [[] for _ in range(len(df))]
     return df.set_index("template_id").to_dict(orient="index")
 
-# ---------- Main UI flow ----------
+# ---------------- Main UI flow ----------------
 req_path = st.session_state.get("req_path", REQUIREMENTS_CSV)
 tpl_path = st.session_state.get("tpl_path", TEMPLATES_CSV)
 excel_path = st.session_state.get("excel_kb_path", EXCEL_KB_PATH)
+programs_kb_path = st.session_state.get("programs_kb_path", PROGRAMS_KB_PATH)
 
 req_df = load_requirements(req_path)
 templates = load_templates(tpl_path)
 excel_kb = load_excel_kb(excel_path)
+programs_kb = load_programs_kb(programs_kb_path)
 
 if req_df.empty:
     st.warning(f"Requirements CSV ikke fundet eller tom: {req_path}")
 if not templates:
     st.warning(f"Templates CSV ikke fundet eller tom: {tpl_path}")
-if not excel_kb:
-    st.info(f"Excel KB ikke fundet eller tom: {excel_path} — app kan stadig bruge fallback flow.")
+if not programs_kb:
+    st.info(f"Programmes KB ikke fundet eller tom: {programs_kb_path} — programdetektion vil ikke være aktiv.")
 
 model = None
 if SentenceTransformer is not None:
@@ -466,48 +506,96 @@ if SentenceTransformer is not None:
     except Exception:
         model = None
 
-st.subheader("Test input (hybrid, KB-first)")
+st.subheader("Test input (KB-first)")
 with st.form("email_form"):
     subject = st.text_input("Subject", value="")
     body = st.text_area("Body", value="", height=200)
     applicant_name = st.text_input("Applicant name (valgfri)", value="")
-    program = st.text_input("Program (valgfri)", value="")
+    program_manual = st.text_input("Manuelt valgt program (valgfri)", value="")
     use_openai_checkbox = st.checkbox("Use OpenAI for slot extraction / draft", value=bool(OPENAI_API_KEY))
     submitted = st.form_submit_button("Preview svar")
 if not submitted:
     st.info("Indtast subject/body og klik Preview.")
 else:
     combined = f"{subject}\n\n{body}"
-    st.markdown(f"**KB-only mode:** `{use_excel_kb_only}` — Excel KB path: `{excel_path}`")
-    # Basic semantic matching optional (kept minimal)
-    query_emb = None
-    rows_index, index_embs = ([], None)
+    # store last mail text for sidebar/other flows
+    st.session_state["last_mail_text"] = combined
+
+    # Program detection + simple UI
+    program_rows = None
+    selected_program_meta = st.session_state.get("selected_program", None)
+
+    if programs_kb:
+        candidates = detect_program_from_mail_simple(combined, programs_kb, top_n=4)
+    else:
+        candidates = []
+
+    if candidates:
+        st.markdown("**Foreslåede programmer (auto-detekteret):**")
+        for i, (row, score) in enumerate(candidates, start=1):
+            st.write(f"{i}. {row.get('programme')}  (score {score:.1f})")
+        # radio choices
+        options = [f"{i+1}: {candidates[i][0].get('programme')}" for i in range(len(candidates))]
+        options.append("Ingen af disse")
+        pick_idx = st.radio("Vælg kandidat (eller Ingen):", options=options, index=0, key="program_pick")
+        if pick_idx != "Ingen af disse":
+            idx = int(pick_idx.split(":")[0]) - 1
+            chosen = candidates[idx][0]
+            st.markdown(f"**Foreslået program valgt:** {chosen.get('programme')}")
+            if st.button("Bekræft valgt program"):
+                st.session_state["selected_program"] = {"programme": chosen.get("programme"), "rows": select_program_rows(chosen.get("programme"), programs_kb)}
+                st.success("Program gemt som valgt.")
+    else:
+        st.info("Ingen tydelige program‑matches i Programmes.xlsx.")
+
+    # manual override
+    all_programs = sorted({(p.get("programme") or "") for p in programs_kb if p.get("programme")})
+    manual_choice = st.selectbox("Eller vælg manuelt et program fra KB (valgfrit):", options=[""] + all_programs, key="manual_program_choice")
+    if manual_choice:
+        st.session_state["selected_program"] = {"programme": manual_choice, "rows": select_program_rows(manual_choice, programs_kb)}
+        st.success(f"Manuelt valgt program: {manual_choice}")
+
+    if program_manual:
+        st.session_state["selected_program"] = {"programme": program_manual, "rows": select_program_rows(program_manual, programs_kb)}
+        st.success(f"Program gemt fra manuelt felt: {program_manual}")
+
+    if st.session_state.get("selected_program"):
+        program_rows = st.session_state["selected_program"].get("rows", None)
+        st.markdown(f"**Aktuelt valgt program:** {st.session_state['selected_program'].get('programme')} (rækker: {len(program_rows) if program_rows else 0})")
+
+    # simple semantic candidate flow from requirements CSV if SentenceTransformer available
+    topk = []
     if model is not None and not req_df.empty:
         try:
             query_emb = embed_texts(model, [combined])[0]
             texts = [" ".join([str(r.get("requirements_cache","")), str(r.get("path","")), str(r.get("question_keywords",""))]) for _, r in req_df.iterrows()]
             embs = embed_texts(model, texts)
-            # simple semantic ranking
             sims = cosine_sim(query_emb, embs)
-            candidates = []
+            candidates_sem = []
             for i, score in enumerate(sims):
                 r = req_df.iloc[i].to_dict()
-                candidates.append((r, float(score)))
-            candidates_sorted = sorted(candidates, key=lambda x: x[1], reverse=True)
-            topk = candidates_sorted[:6]
+                candidates_sem.append((r, float(score)))
+            topk = sorted(candidates_sem, key=lambda x: x[1], reverse=True)[:6]
         except Exception:
             topk = []
     else:
-        topk = []  # we'll still provide KB-based draft if KB-only
+        topk = []
 
-    # If there are no semantic candidates, we still continue to KB draft
-    st.markdown("### Genereret forslag (hvis manual_review / no auto)")
-    # Here we directly produce a draft when manual review desired
-    # For prototype: always attempt to produce a draft using KB if KB-only or if no strong semantic candidate
+    # Now generate draft. If a program is selected, pass its rows to generator and enforce kb_only=True
+    st.markdown("### Genereret forslag (manual / preview)")
     try:
         draft = None
         if use_openai_checkbox and (OPENAI_API_KEY or openai is not None):
-            draft = generate_draft_reply(combined, topk, templates, openai_model=OPENAI_MODEL, excel_kb=excel_kb, kb_only=use_excel_kb_only)
+            if program_rows:
+                # program_rows is a list of rows with 'admission' field
+                draft = generate_draft_reply(combined, topk, templates, openai_model=OPENAI_MODEL, excel_kb=program_rows, kb_only=True)
+            else:
+                # fallback: use global excel_kb if configured and use_excel_kb_only flag
+                excel_kb_global = load_excel_kb(st.session_state.get("excel_kb_path", EXCEL_KB_PATH))
+                draft = generate_draft_reply(combined, topk, templates, openai_model=OPENAI_MODEL, excel_kb=excel_kb_global, kb_only=use_excel_kb_only)
+        else:
+            draft = None
+
         if draft:
             st.markdown("### Forslag (auto‑genereret udkast — rediger før afsendelse)")
             subj_suggestion = draft.get("subject", "") or "Vedr. din henvendelse"
@@ -519,15 +607,24 @@ else:
                 st.info(f"Notes: {draft.get('notes')}")
             st.success("Rediger forslaget og kopier/brug det i din mailklient. App'en sender ikke automatisk.")
         else:
-            # fallback: build a simple KB-based reply if KB is present
-            if use_excel_kb_only and excel_kb:
-                matched = score_kb_rows(excel_kb, combined)
+            # Fallback: show KB-based snippets if program selected or KB-only selected
+            if program_rows:
                 lines = []
-                for r in matched[:4]:
-                    lines.append(f"- {r.get('question','')}: {r.get('answer','')}")
-                fallback_body = "Kære ansøger,\n\n" + "Se venligst nedenstående information fra vores KB:\n\n" + "\n".join(lines) + "\n\nHvis du har brug for yderligere hjælp, svar venligst på denne mail.\n\nMed venlig hilsen\nStudiekontoret"
+                for r in program_rows[:4]:
+                    lines.append(f"- {r.get('programme')}: {r.get('admission')[:400]}")
+                fallback_body = "Kære ansøger,\n\nSe venligst nedenstående information fra vores KB:\n\n" + "\n".join(lines) + "\n\nHvis du har brug for yderligere hjælp, svar venligst på denne mail.\n\nMed venlig hilsen\nStudiekontoret"
                 st.text_input("Suggested subject (edit):", value="Vedr. din henvendelse", key="fallback_subj")
                 st.text_area("Suggested body (edit):", value=fallback_body, height=300, key="fallback_body")
+            elif use_excel_kb_only and excel_kb:
+                matched = excel_kb[:4]
+                lines = []
+                for r in matched:
+                    q = r.get("question") or ""
+                    a = r.get("answer") or ""
+                    lines.append(f"- {q}: {a[:300]}")
+                fallback_body = "Kære ansøger,\n\nSe venligst nedenstående information fra vores KB:\n\n" + "\n".join(lines) + "\n\nMed venlig hilsen\nStudiekontoret"
+                st.text_input("Suggested subject (edit):", value="Vedr. din henvendelse", key="fallback_subj2")
+                st.text_area("Suggested body (edit):", value=fallback_body, height=300, key="fallback_body2")
             else:
                 st.info("Ingen OpenAI‑udkast genereret eller OpenAI ikke konfigureret. Brug KB eller skriv manuelt.")
     except Exception as e:
@@ -536,4 +633,4 @@ else:
         st.text_area("Traceback", value=tb, height=300)
 
 st.write("---")
-st.caption("KB-first prototype: Excel KB (ID/Question/Answer) + OpenAI (REST fallback). Husk at sætte OPENAI_API_KEY i st.secrets eller som miljøvariabel.")
+st.caption("KB-first prototype: Programmes.xlsx (ID/Programme/Admission requiements) + OpenAI (REST fallback). Husk at sætte OPENAI_API_KEY i st.secrets eller som miljøvariabel.")
