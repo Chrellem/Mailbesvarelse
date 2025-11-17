@@ -8,3 +8,4 @@ jinja2
 python-dotenv
 sentence-transformers
 torch
+pyyaml
