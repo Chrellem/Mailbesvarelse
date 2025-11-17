@@ -53,6 +53,6 @@ instruction: |
     først vurdere, hvad informationen dækker, før du svarer borgeren. Output skal
     altid være på dansk og indeholde: intern vurdering + svar til ansøger.
 
-temperature: 1.00
-top_p: 1.0
+temperature: 0.5
+top_p: 0.2
 model: "gpt-3.5-turbo"
