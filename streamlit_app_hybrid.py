@@ -1,15 +1,9 @@
 """
 streamlit_app_hybrid.py
 
-KB-first mail-besvarelse app using a repository YAML file for assistant instruction and generation params.
-
-Features in this patch:
-- Robust YAML loader: handles single or multi-document YAML by merging documents (later docs override earlier keys).
-- Uses config/assistant_config.yaml for instruction, temperature, top_p, model.
-- Falls back to sidebar assistant prompt if YAML missing/empty.
-- Shows parsed config and debug of messages sent to the model.
-- No OpenAI Assistants API calls — only chat completions (REST or openai client).
-- Keeps programme detection, FAQ matching and KB-driven generation.
+KB-first mail-besvarelse app (patched).
+Patch: load_assistant_config bruger filens mtime som cache-key, så ændringer i config/assistant_config.yaml
+automatisk fører til genindlæsning. Der er også en reload-knap som rydder cache.
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -76,11 +70,12 @@ if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
 if st.sidebar.button("Reload assistant config now"):
-    # clear cached loader
+    # clear all st.cache_data caches (robust)
     try:
-        load_assistant_config.clear()
+        st.cache_data.clear()
+        st.sidebar.success("Cache ryddet — config genindlæses ved næste handling.")
     except Exception:
-        st.sidebar.info("Cache clear not available in this environment; reload app to refresh.")
+        st.sidebar.error("Kunne ikke rydde cache programmatisk; genstart app for at tvinge reload.")
 
 # Read OPENAI key from st.secrets or environment
 OPENAI_API_KEY = None
@@ -103,42 +98,38 @@ if openai is not None and OPENAI_API_KEY:
     except Exception:
         pass
 
-# ---------------- Robust YAML loader (single or multi-document) ----------------
-@st.cache_data(ttl=300)
-def load_assistant_config(path: str) -> Dict[str, Any]:
+# ---------------- Robust YAML loader (mtime-aware cache key) ----------------
+# Note: st.cache_data caches based on function args; we include file mtime so changes force reload.
+@st.cache_data(ttl=3600)
+def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     """
-    Load assistant config YAML from repo. Handles single-document or multi-document YAML.
-    Multi-document YAML will be merged sequentially (later docs override earlier keys).
+    Load assistant config YAML from repo. mtime param is used only for caching key.
     Returns dict with keys (some may be None):
       instruction: str
       temperature: float
       top_p: float
       model: str
-    On parse error, returns a dict with key "_parse_error" describing the issue.
+    If parse error, returns {"_parse_error": "message"}.
     """
-    if not path:
-        return {}
-    if not os.path.exists(path):
+    if not path or not os.path.exists(path):
         return {}
     if yaml is None:
         return {"_parse_error": "PyYAML not installed"}
     try:
         with open(path, "r", encoding="utf-8") as fh:
+            # support multi-document but merge them (later docs override earlier)
             docs = list(yaml.safe_load_all(fh))
     except Exception as e:
         return {"_parse_error": str(e)}
 
-    # Merge documents: later docs override earlier ones
     merged: Dict[str, Any] = {}
     for d in docs:
         if not d:
             continue
         if not isinstance(d, dict):
-            # ignore non-dict documents
             continue
         merged.update(d)
 
-    # Normalize types
     out: Dict[str, Any] = {}
     instr = merged.get("instruction")
     out["instruction"] = str(instr).strip() if instr is not None else None
@@ -159,6 +150,18 @@ def load_assistant_config(path: str) -> Dict[str, Any]:
     out["model"] = str(model) if model is not None else None
 
     return out
+
+# Convenience wrapper that computes mtime and calls cached loader
+def load_assistant_config(path: str) -> Dict[str, Any]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = time.time()
+    return load_assistant_config_with_mtime(path, mtime)
 
 # ---------------- Helper: extract text from JSON response (robust) ----------------
 def extract_text_from_response_json(j: Any) -> str:
@@ -447,7 +450,10 @@ if not assistant_config:
 else:
     if isinstance(assistant_config, dict) and "_parse_error" in assistant_config:
         st.sidebar.error(f"Config parse error: {assistant_config['_parse_error']}")
-        st.sidebar.text_area("assistant_config (raw)", value=open(assistant_config_path, "r", encoding="utf-8").read(), height=200)
+        try:
+            st.sidebar.text_area("assistant_config (raw)", value=open(assistant_config_path, "r", encoding="utf-8").read(), height=200)
+        except Exception:
+            pass
     else:
         try:
             st.sidebar.text_area("assistant_config (parsed)", value=json.dumps(assistant_config, ensure_ascii=False, indent=2), height=200)
