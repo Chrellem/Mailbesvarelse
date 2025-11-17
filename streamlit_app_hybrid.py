@@ -1,20 +1,18 @@
 """
 streamlit_app_hybrid.py
 
-KB-first prototype with Programme detection + FAQ supplementation and optional OpenAI Assistant integration.
+KB-first mail-besvarelse app with:
+- automatic programme detection via sheets/Programmes.xlsx
+- supplement from sheets/faq_kb.xlsx
+- assistant-instruction fetched from OpenAI Assistants API (ASSISTANT_ID from st.secrets) and used as assistant-role prompt
+- assistant_instruction is cached and used to shape tone/format; final generation is done via chat completions (create_chat_completion)
+- robust Assistants API fallback and chat completions REST fallback
+- safe KB-only system constraint: assistant instruction cannot override the KB constraint
 
-This version:
-- If ASSISTANT_ID is set in Streamlit secrets, the app will attempt to call the OpenAI Assistants API
-  for generation using that assistant_id. If the Assistants API call fails (e.g., no access, 403, etc.),
-  the app will fall back to the prior chat-completion flow and will show an error/debug message.
-- The assistant is used as the primary generator when available (per your choice). If Assistants API
-  is not accessible, you'll receive an actionable error in the UI.
-- Keeps the KB-only constraints: system message always enforces "use only KB" rules; assistant cannot
-  override that.
-- Reads ASSISTANT_ID from st.secrets["ASSISTANT_ID"] (recommended). You may also set it in env if you prefer.
-- Note: ensure openpyxl in requirements.txt if you use .xlsx files.
-
-Place this file as streamlit_app_hybrid.py and restart Streamlit.
+Instructions:
+- Put Programmes.xlsx and faq_kb.xlsx in sheets/
+- Add OPENAI_API_KEY and ASSISTANT_ID to .streamlit/secrets.toml (or Streamlit Cloud secrets)
+- Ensure required packages (requirements.txt) are installed (openpyxl, openai, requests, streamlit, pandas, etc.)
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -23,6 +21,7 @@ import json
 import ssl
 import urllib.request
 import traceback
+import time
 
 import numpy as np
 import pandas as pd
@@ -35,7 +34,7 @@ try:
 except Exception:
     SentenceTransformer = None
 
-# OpenAI import (may be None)
+# OpenAI import (may be installed or not)
 try:
     import openai
 except Exception:
@@ -101,10 +100,6 @@ if openai is not None and OPENAI_API_KEY:
 
 # ---------------- Helper: extract text from JSON response (robust) ----------------
 def extract_text_from_response_json(j: Any) -> str:
-    """
-    Try to find a meaningful text string inside a JSON response from various OpenAI endpoints.
-    Returns first large-ish string found, or the full JSON repr truncated.
-    """
     texts = []
 
     def recurse(o):
@@ -117,17 +112,14 @@ def extract_text_from_response_json(j: Any) -> str:
         elif isinstance(o, list):
             for item in o:
                 recurse(item)
-        # other types ignored
 
     try:
         recurse(j)
     except Exception:
         pass
-    # prefer the longest found text
     if texts:
         texts_sorted = sorted(texts, key=lambda s: len(s), reverse=True)
         return texts_sorted[0]
-    # fallback: serialized JSON truncated
     try:
         return json.dumps(j, ensure_ascii=False)[:4000]
     except Exception:
@@ -135,35 +127,21 @@ def extract_text_from_response_json(j: Any) -> str:
 
 # ---------------- OpenAI Assistants API call (attempt) ----------------
 def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]], model: str = None, timeout: int = 30) -> Tuple[str, Any]:
-    """
-    Attempt to call the OpenAI Assistants API for the given assistant_id.
-    - First try using the openai.OpenAI client if present and supports 'assistants' or similar.
-    - Else try REST call to /v1/assistants/{assistant_id}/responses with payload {"input":{"messages": messages}}
-    Returns (extracted_text, raw_json).
-    Raises RuntimeError on HTTP error or missing credentials.
-    """
     if not assistant_id:
         raise RuntimeError("No assistant_id provided")
 
-    # Prepare a payload for Assistants API (common shape)
     payload = {"input": {"messages": messages}}
 
-    # Try Python client path (best-effort; different client versions differ)
     if openai is not None:
         try:
             OpenAI = getattr(openai, "OpenAI", None)
             if OpenAI:
                 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
-                # the attribute name may differ by client version; try a few variants safely
                 try:
-                    # new style: client.assistants.responses.create(...)
                     resp = client.assistants.responses.create(assistant=assistant_id, input={"messages": messages})
                 except Exception:
-                    # older or differing skins: try client.chat.completions.create with assistant id in input
                     resp = client.chat.completions.create(model=(model or OPENAI_MODEL), messages=messages, max_tokens=700)
-                # resp may be an object or dict
                 j = resp if isinstance(resp, dict) else (resp.__dict__ if hasattr(resp, "__dict__") else resp)
-                # attempt to convert to JSON/dict
                 try:
                     jdict = json.loads(json.dumps(j, default=lambda o: getattr(o, "__dict__", str(o)), ensure_ascii=False))
                 except Exception:
@@ -171,10 +149,8 @@ def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]],
                 text = extract_text_from_response_json(jdict)
                 return text, jdict
         except Exception as e:
-            # swallow and fall through to REST fallback; keep the exception for debugging
             client_exc = e
 
-    # REST fallback to Assistants endpoint
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY required for REST Assistant call")
 
@@ -184,11 +160,9 @@ def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]],
         import requests
         r = requests.post(url, headers=headers, json=payload, timeout=timeout)
         if r.status_code >= 400:
-            # raise with helpful message
             raise RuntimeError(f"Assistants API HTTP {r.status_code}: {r.text}")
         j = r.json()
     except Exception as e:
-        # Try urllib fallback
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -200,18 +174,13 @@ def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]],
     text = extract_text_from_response_json(j)
     return text, j
 
-# ---------------- Existing Chat completion wrapper (fallback) ----------------
+# ---------------- Chat completion wrapper (fallback) ----------------
 def create_chat_completion(messages: List[Dict[str, str]],
                            model: str = None,
                            max_tokens: int = 400,
                            temperature: float = 0.2) -> Tuple[str, Any]:
-    """
-    Returns (text, raw_response).
-    Uses chat completions (OpenAI client or REST) as fallback if Assistants API is not used.
-    """
     model = model or OPENAI_MODEL
 
-    # Try new client chat completions
     if openai is not None:
         try:
             OpenAI = getattr(openai, "OpenAI", None)
@@ -223,7 +192,6 @@ def create_chat_completion(messages: List[Dict[str, str]],
                     max_tokens=max_tokens,
                     temperature=temperature
                 )
-                # Try to extract assistant text
                 try:
                     text = resp.choices[0].message.content
                 except Exception:
@@ -235,7 +203,6 @@ def create_chat_completion(messages: List[Dict[str, str]],
         except Exception:
             pass
 
-    # REST fallback (chat completions)
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not available for REST fallback. Please set the key in st.secrets or env.")
 
@@ -249,7 +216,6 @@ def create_chat_completion(messages: List[Dict[str, str]],
         r.raise_for_status()
         j = r.json()
     except Exception:
-        # urllib fallback
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -403,71 +369,66 @@ def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict
             parts.append(f"- Q: {q}\n  A: {snippet}")
     return "\n".join(parts)
 
-# ---------------- Generation with assistant API support ----------------
+# ---------------- Fetch assistant instruction (cached) ----------------
+def fetch_assistant_instruction(assistant_id: str, ttl_seconds: int = 3600) -> str:
+    if not assistant_id:
+        return None
+
+    cache_key = f"assistant_instruction_cache_{assistant_id}"
+    cached = st.session_state.get(cache_key)
+    now = time.time()
+    if cached and isinstance(cached, dict):
+        if cached.get("ts") and (now - cached["ts"] < ttl_seconds):
+            return cached.get("instruction")
+
+    ask_messages = [
+        {"role": "system", "content": "You are an assistant configuration endpoint. Produce a short assistant instruction block (max 3-5 lines) that describes persona, tone, preferred structure and constraints to be used when composing email replies. Return ONLY the instruction text (no JSON, no extra commentary)."},
+        {"role": "user", "content": "Provide the assistant instruction text now."}
+    ]
+
+    try:
+        text, raw = call_openai_assistant_api(assistant_id, ask_messages)
+        instr = (text or "").strip()
+        st.session_state[cache_key] = {"instruction": instr or None, "ts": now}
+        return instr or None
+    except Exception as e:
+        st.sidebar.error(f"Cannot fetch assistant instruction: {type(e).__name__}: {e}")
+        st.session_state[cache_key] = {"instruction": None, "ts": now}
+        return None
+
+# ---------------- Generation using assistant instruction (assistant-as-prompt) ----------------
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
                             faq_rows: List[Dict[str,str]] = None,
                             language: str = "da",
                             openai_model: str = None,
                             assistant_prompt: str = None,
-                            assistant_id: str = None) -> Dict[str, Any]:
-    """
-    If assistant_id is provided, attempt to call the Assistants API using that id.
-    If that fails or no assistant_id is provided, fallback to chat-completion flow (create_chat_completion).
-    Returns dict: {subject, body, confidence, notes}
-    """
+                            assistant_instruction: str = None) -> Dict[str, Any]:
     model = openai_model or OPENAI_MODEL
     kb_block = build_kb_block(program_rows, faq_rows)
     lang_name = "dansk" if language == "da" else "english"
 
-    # System message: enforce KB-only constraints
     base_system = (
-        f"You are an assistant that must answer a prospective student's question. "
-        f"You MUST ONLY use the information provided in the 'KB block' below. Do NOT invent or assume anything. "
+        f"You are a helpful assistant that must answer a prospective student's question. "
+        f"YOU MUST ONLY use the information provided in the 'KB block' below. Do NOT invent or assume anything. "
         f"If the KB does not contain enough information to answer, respond with a short clarification question asking for the missing info. "
         f"Reply in {lang_name}. Output must be a single JSON object with keys: subject, body, confidence (0-1), notes."
     )
 
-    # Build message sequence (chat form) we use for both assistant API and chat completions
     messages: List[Dict[str, str]] = [{"role": "system", "content": base_system}]
-    # include assistant_prompt as an assistant role if present (non-system)
-    if assistant_prompt:
-        messages.append({"role": "assistant", "content": assistant_prompt})
+
+    instr = assistant_instruction or assistant_prompt or st.session_state.get("assistant_prompt", None)
+    if instr:
+        messages.append({"role": "assistant", "content": instr})
+
     user = f"Mail:\n'''{mail_text}'''\n\nKB block:\n{kb_block}\n\nInstructions:\n- Answer the most important question first.\n- If the mail refers to a specific programme, refer to it by name.\n- Keep the reply concise and practical.\n- If KB is insufficient, ask one clear follow-up question.\nReturn only JSON."
     messages.append({"role": "user", "content": user})
 
-    # If assistant_id is configured, try the Assistants API first.
-    if assistant_id:
-        try:
-            text, raw = call_openai_assistant_api(assistant_id, messages, model=model)
-            # try parse JSON from text
-            try:
-                parsed_attempt = json.loads(text)
-                return parsed_attempt
-            except Exception:
-                # maybe raw contains JSON somewhere; try parse raw
-                try:
-                    parsed = json.loads(json.dumps(raw, default=lambda o: getattr(o, "__dict__", str(o)), ensure_ascii=False))
-                    # try to convert to a dict that contains a text output
-                    out_text = extract_text_from_response_json(parsed)
-                    try:
-                        return json.loads(out_text)
-                    except Exception:
-                        return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Assistant returned non-JSON text"}
-                except Exception:
-                    return {"subject": "", "body": text, "confidence": 0.0, "notes": "Assistant returned non-JSON text"}
-        except Exception as e:
-            # Show error in UI but fall back to chat completions
-            st.sidebar.error(f"Assistants API call failed: {type(e).__name__}: {e}")
-            # continue to fallback
-
-    # Fallback: create chat completion (chat/completions endpoint)
     try:
         out_text, resp = create_chat_completion(messages, model=model, max_tokens=700, temperature=0.0)
     except Exception as e:
         return {"subject": "", "body": f"Fejl ved opkald til model: {e}", "confidence": 0.0, "notes": "LLM call failed"}
 
-    # parse JSON from out_text
     try:
         parsed = json.loads(out_text)
         return parsed
@@ -519,27 +480,28 @@ else:
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
 
-    # 4) generate reply
-    assistant_prompt_to_use = st.session_state.get("assistant_prompt", None)
-    # Read assistant id from secrets (already loaded early)
-    assistant_id_to_use = ASSISTANT_ID
+    # 4) fetch assistant instruction (cached). This will attempt to call Assistants API once per TTL.
+    assistant_instruction_to_use = None
+    if ASSISTANT_ID:
+        assistant_instruction_to_use = fetch_assistant_instruction(ASSISTANT_ID)
 
+    # 5) generate reply using assistant_instruction_to_use (if any) shaping the style
     if uddannelses_relateret and selected_program_rows:
         reply = generate_combined_reply(combined,
                                         program_rows=selected_program_rows,
                                         faq_rows=faq_to_use,
                                         language=language,
                                         openai_model=OPENAI_MODEL,
-                                        assistant_prompt=assistant_prompt_to_use,
-                                        assistant_id=assistant_id_to_use)
+                                        assistant_prompt=None,
+                                        assistant_instruction=assistant_instruction_to_use)
     else:
         reply = generate_combined_reply(combined,
                                         program_rows=None,
                                         faq_rows=faq_to_use,
                                         language=language,
                                         openai_model=OPENAI_MODEL,
-                                        assistant_prompt=assistant_prompt_to_use,
-                                        assistant_id=assistant_id_to_use)
+                                        assistant_prompt=None,
+                                        assistant_instruction=assistant_instruction_to_use)
 
     no_program_match = (not uddannelses_relateret)
     no_faq_match = len(faq_to_use) == 0
@@ -566,4 +528,4 @@ else:
             st.info(f"Notes: {reply.get('notes')}")
 
 st.write("---")
-st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → generate constrained reply. If ASSISTANT_ID is set in st.secrets the app tries the Assistants API first (falls back to chat completions).")
+st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → fetch assistant-instruction (Assistants API) → inject as assistant-role → final chat completion generation. Add OPENAI_API_KEY and ASSISTANT_ID in st.secrets.")
