@@ -7,12 +7,7 @@ KB-first mail-besvarelse app with:
 - assistant-instruction fetched from OpenAI Assistants API (ASSISTANT_ID from st.secrets) and used as assistant-role prompt
 - assistant_instruction is cached and used to shape tone/format; final generation is done via chat completions (create_chat_completion)
 - robust Assistants API fallback and chat completions REST fallback
-- safe KB-only system constraint: assistant instruction cannot override the KB constraint
-
-Instructions:
-- Put Programmes.xlsx and faq_kb.xlsx in sheets/
-- Add OPENAI_API_KEY and ASSISTANT_ID to .streamlit/secrets.toml (or Streamlit Cloud secrets)
-- Ensure required packages (requirements.txt) are installed (openpyxl, openai, requests, streamlit, pandas, etc.)
+- debug panel in sidebar to inspect assistant fetch / raw response
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -127,11 +122,17 @@ def extract_text_from_response_json(j: Any) -> str:
 
 # ---------------- OpenAI Assistants API call (attempt) ----------------
 def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]], model: str = None, timeout: int = 30) -> Tuple[str, Any]:
+    """
+    Try Assistants API first (client or REST). Store raw JSON response in st.session_state['assistant_raw_response'] for debugging.
+    Returns (extracted_text, raw_json).
+    Raises RuntimeError on missing credentials or hard error.
+    """
     if not assistant_id:
         raise RuntimeError("No assistant_id provided")
 
     payload = {"input": {"messages": messages}}
 
+    # Try Python client path
     if openai is not None:
         try:
             OpenAI = getattr(openai, "OpenAI", None)
@@ -140,17 +141,25 @@ def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]],
                 try:
                     resp = client.assistants.responses.create(assistant=assistant_id, input={"messages": messages})
                 except Exception:
+                    # fallback to chat completions if client doesn't support assistants
                     resp = client.chat.completions.create(model=(model or OPENAI_MODEL), messages=messages, max_tokens=700)
                 j = resp if isinstance(resp, dict) else (resp.__dict__ if hasattr(resp, "__dict__") else resp)
                 try:
                     jdict = json.loads(json.dumps(j, default=lambda o: getattr(o, "__dict__", str(o)), ensure_ascii=False))
                 except Exception:
                     jdict = j
+                # store raw response for debugging
+                try:
+                    st.session_state["assistant_raw_response"] = jdict
+                except Exception:
+                    pass
                 text = extract_text_from_response_json(jdict)
                 return text, jdict
-        except Exception as e:
-            client_exc = e
+        except Exception:
+            # continue to REST fallback
+            pass
 
+    # REST fallback to Assistants endpoint
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY required for REST Assistant call")
 
@@ -162,13 +171,23 @@ def call_openai_assistant_api(assistant_id: str, messages: List[Dict[str, str]],
         if r.status_code >= 400:
             raise RuntimeError(f"Assistants API HTTP {r.status_code}: {r.text}")
         j = r.json()
+        # store raw response for debugging
+        try:
+            st.session_state["assistant_raw_response"] = j
+        except Exception:
+            pass
     except Exception as e:
+        # urllib fallback
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             ctx = ssl.create_default_context()
             with urllib.request.urlopen(req, context=ctx, timeout=timeout) as fh:
                 j = json.load(fh)
+            try:
+                st.session_state["assistant_raw_response"] = j
+            except Exception:
+                pass
         except Exception as e2:
             raise RuntimeError(f"Assistants API call failed (requests error: {e}; urllib error: {e2})")
     text = extract_text_from_response_json(j)
@@ -181,6 +200,7 @@ def create_chat_completion(messages: List[Dict[str, str]],
                            temperature: float = 0.2) -> Tuple[str, Any]:
     model = model or OPENAI_MODEL
 
+    # Try new client chat completions
     if openai is not None:
         try:
             OpenAI = getattr(openai, "OpenAI", None)
@@ -203,6 +223,7 @@ def create_chat_completion(messages: List[Dict[str, str]],
         except Exception:
             pass
 
+    # REST fallback (chat completions)
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not available for REST fallback. Please set the key in st.secrets or env.")
 
@@ -442,6 +463,49 @@ def generate_combined_reply(mail_text: str,
                 pass
     return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Kunne ikke parse JSON fra model; se body"}
 
+# ---------------- Assistant debug panel (sidebar) ----------------
+# This section provides controls to force-fetch the assistant instruction and inspect raw response
+st.sidebar.markdown("### Assistant debug")
+st.sidebar.write("ASSISTANT_ID set:", bool(ASSISTANT_ID))
+if ASSISTANT_ID:
+    try:
+        st.sidebar.write("ASSISTANT_ID (masked):", ASSISTANT_ID[:6] + "..." + ASSISTANT_ID[-4:])
+    except Exception:
+        st.sidebar.write("ASSISTANT_ID (masked): <error masking>")
+else:
+    st.sidebar.write("ASSISTANT_ID: (ikke sat)")
+
+if st.sidebar.button("Fetch assistant instruction (debug)"):
+    try:
+        instr = fetch_assistant_instruction(ASSISTANT_ID)
+        if instr:
+            st.sidebar.success("Hentet assistant instruction og cachet.")
+        else:
+            st.sidebar.info("Ingen instruction returneret (tom). Tjek raw respons.")
+    except Exception as _e:
+        st.sidebar.error(f"Fejl ved hentning: {_e}")
+
+# vis cached instruction hvis den findes
+cache_key_dbg = f"assistant_instruction_cache_{ASSISTANT_ID}" if ASSISTANT_ID else None
+cached_dbg = st.session_state.get(cache_key_dbg) if cache_key_dbg else None
+if cached_dbg:
+    st.sidebar.markdown("Cached assistant instruction:")
+    st.sidebar.text_area("Instruktion (cache)", value=cached_dbg.get("instruction", "") or "<tom>", height=120)
+    ts = cached_dbg.get("ts", 0)
+    try:
+        st.sidebar.write("Cached ts (UTC):", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)))
+    except Exception:
+        pass
+
+# vis rå respons (sidste kald)
+raw = st.session_state.get("assistant_raw_response")
+if raw:
+    st.sidebar.markdown("Raw Assistants API respons (sidste kald)")
+    try:
+        st.sidebar.text_area("Assistant raw JSON", value=json.dumps(raw, ensure_ascii=False, indent=2), height=240)
+    except Exception:
+        st.sidebar.text_area("Assistant raw (repr)", value=str(raw)[:4096], height=240)
+
 # ---------------- Main UI / flow ----------------
 programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS_KB_DEFAULT))
 faq_kb = load_faq_kb(st.session_state.get("faq_kb_path", FAQ_KB_DEFAULT))
@@ -480,12 +544,20 @@ else:
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
 
-    # 4) fetch assistant instruction (cached). This will attempt to call Assistants API once per TTL.
+    # 4) fetch assistant instruction (cached)
     assistant_instruction_to_use = None
     if ASSISTANT_ID:
         assistant_instruction_to_use = fetch_assistant_instruction(ASSISTANT_ID)
 
-    # 5) generate reply using assistant_instruction_to_use (if any) shaping the style
+    # vis hvilken instruction der bruges
+    st.markdown("**Assistant instruction (brugt til denne generering):**")
+    if assistant_instruction_to_use:
+        st.text_area("Assistant instruction (used)", value=assistant_instruction_to_use, height=120)
+    else:
+        fallback_instr = st.session_state.get("assistant_prompt", None)
+        st.text_area("Assistant instruction (none fetched) — fallback prompt (if any)", value=fallback_instr or "<ingen>", height=120)
+
+    # 5) generate reply using assistant_instruction_to_use (if any)
     if uddannelses_relateret and selected_program_rows:
         reply = generate_combined_reply(combined,
                                         program_rows=selected_program_rows,
