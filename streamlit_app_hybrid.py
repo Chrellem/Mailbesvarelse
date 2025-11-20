@@ -44,7 +44,7 @@ FAQ_KB_DEFAULT = "sheets/faq_kb.xlsx"
 ASSISTANT_CONFIG_DEFAULT = "config/assistant_config.yaml"
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-PROGRAM_DETECT_THRESHOLD = float(os.getenv("PROGRAM_DETECT_THRESHOLD", "2.5"))
+PROGRAM_DETECT_THRESHOLD = float(os.getenv("PROGRAM_DETECT_THRESHOLD", "7.00"))
 FAQ_MATCH_TOPK = int(os.getenv("FAQ_MATCH_TOPK", "3"))
 KB_SNIPPET_MAX_CHARS = 800
 
