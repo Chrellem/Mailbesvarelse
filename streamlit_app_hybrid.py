@@ -1,11 +1,15 @@
 """
 streamlit_app_hybrid.py
 
-KB-first mail-besvarelse app (mtime-aware YAML loader).
+KB-first mail-besvarelse app (mtime-aware YAML loader) with feedback capture.
 
-Patch: Når brugeren indsætter et nyt spørgsmål og trykker Preview, rydder vi
-midlertidige session_state-keys (fx tidligere svar, debug messages) så appen
-ikke "husker" gamle svar. Vi bevarer assistant_instruction cache og config.
+Features in this file:
+- Load assistant instruction + generation params from config/assistant_config.yaml (mtime-aware caching)
+- KB-driven flow: Program detection (Programmes.xlsx) + FAQ supplementation (faq_kb.xlsx)
+- Generate constrained reply via chat completions (model, temperature, top_p from YAML or fallback)
+- Debug UI: parsed YAML, messages sent
+- Reset transient state on each Preview so previous replies are not reused
+- Feedback UI: textarea + "Save feedback" button which appends the input, model output and feedback to an Excel file (feedback/feedback.xlsx)
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -15,6 +19,7 @@ import ssl
 import urllib.request
 import traceback
 import time
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -50,6 +55,9 @@ PROGRAM_DETECT_THRESHOLD = float(os.getenv("PROGRAM_DETECT_THRESHOLD", "2.5"))
 FAQ_MATCH_TOPK = int(os.getenv("FAQ_MATCH_TOPK", "3"))
 KB_SNIPPET_MAX_CHARS = 800
 
+FEEDBACK_DIR = "feedback"
+FEEDBACK_FILE = os.path.join(FEEDBACK_DIR, "feedback.xlsx")
+
 st.set_page_config(page_title="Mailbesvarelse — KB-driven", layout="wide")
 st.title("Mail‑besvarelse — KB‑driven (Program + FAQ)")
 
@@ -72,7 +80,7 @@ if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
 if st.sidebar.button("Reload assistant config now"):
-    # clear cached loader
+    # Try to clear cache for config loader
     try:
         load_assistant_config_with_mtime.clear()
         st.sidebar.success("Config cache ryddet — vil genindlæse ved næste handling.")
@@ -109,12 +117,12 @@ if openai is not None and OPENAI_API_KEY:
 def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     """
     Load assistant config YAML from repo. mtime param is used only for caching key.
-    Returns dict with keys (some may be None):
-      instruction: str
-      temperature: float
-      top_p: float
-      model: str
-    If parse error, returns {"_parse_error": "message"}.
+    Returns dict with keys:
+      instruction: str or None
+      temperature: float or None
+      top_p: float or None
+      model: str or None
+    On parse error, returns {"_parse_error": "message"}.
     """
     if not path or not os.path.exists(path):
         return {}
@@ -126,6 +134,7 @@ def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     except Exception as e:
         return {"_parse_error": str(e)}
 
+    # Merge documents: later docs override earlier ones
     merged: Dict[str, Any] = {}
     for d in docs:
         if not d:
@@ -390,6 +399,29 @@ def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict
             parts.append(f"- Q: {q}\n  A: {snippet}")
     return "\n".join(parts)
 
+# ---------------- Save feedback (append to Excel) ----------------
+def save_feedback_row(row: Dict[str, Any], path: str = FEEDBACK_FILE) -> Tuple[bool, str]:
+    """
+    Append a feedback row (dict) to an Excel file. If file exists, load, append and overwrite.
+    Returns (success, message).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        if os.path.exists(path):
+            try:
+                existing = pd.read_excel(path, engine="openpyxl")
+            except Exception:
+                # fallback: try without engine
+                existing = pd.read_excel(path)
+            df = existing.append(row, ignore_index=True)
+        else:
+            df = pd.DataFrame([row])
+        # write back (overwrite)
+        df.to_excel(path, index=False, engine="openpyxl")
+        return True, f"Saved to {path}"
+    except Exception as e:
+        return False, f"Failed to save feedback: {e}"
+
 # ---------------- Generation using YAML instruction ----------------
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
@@ -573,5 +605,56 @@ else:
         if reply.get("notes"):
             st.info(f"Notes: {reply.get('notes')}")
 
+        # ---------------- Feedback UI ----------------
+        st.markdown("### Feedback på dette svar")
+        feedback_text = st.text_area("Skriv din feedback her", value=st.session_state.get("feedback_text", ""), height=160, key="feedback_text_input")
+        rating = st.selectbox("Vurder svar (valgfrit)", options=["", "1 - meget utilfreds", "2", "3", "4", "5 - meget tilfreds"], index=0)
+        if st.button("Gem feedback", key="save_feedback_btn"):
+            # Collect data to save
+            mail_subject_orig = subject or ""
+            mail_body_orig = body or ""
+            generated_subject = st.session_state.get("reply_subj", "") or subj
+            generated_body = st.session_state.get("reply_body", "") or body_out
+            confidence = reply.get("confidence") if isinstance(reply.get("confidence"), (int, float)) else reply.get("confidence", "")
+            program_name = selected_program_rows[0]['programme'] if selected_program_rows else ""
+            timestamp = datetime.utcnow().isoformat() + "Z"
+
+            # Construct feedback row
+            row = {
+                "timestamp_utc": timestamp,
+                "mail_subject": mail_subject_orig,
+                "mail_body": mail_body_orig,
+                "generated_subject": generated_subject,
+                "generated_body": generated_body,
+                "confidence": confidence,
+                "program_detected": program_name,
+                "model": used_model,
+                "temperature": used_temp,
+                "top_p": used_top_p,
+                "assistant_instruction": (assistant_instruction_to_use or "")[:4000],
+                "feedback_text": feedback_text or "",
+                "rating": rating or ""
+            }
+
+            ok, msg = save_feedback_row(row, FEEDBACK_FILE)
+            if ok:
+                st.success("Feedback gemt. " + msg)
+                # clear feedback box
+                try:
+                    st.session_state["feedback_text_input"] = ""
+                except Exception:
+                    pass
+            else:
+                st.error(msg)
+
+    # show messages that were sent for debugging (if present)
+    messages_debug = st.session_state.get("last_messages_sent")
+    if messages_debug:
+        st.markdown("**Messages sent to model (debug)**")
+        try:
+            st.text_area("messages", value=json.dumps(messages_debug, ensure_ascii=False, indent=2), height=200)
+        except Exception:
+            st.text_area("messages (repr)", value=str(messages_debug)[:4096], height=200)
+
 st.write("---")
-st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation.")
+st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation. Use the feedback box to save examples to feedback/feedback.xlsx.")
