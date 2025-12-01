@@ -1,4 +1,9 @@
-# (Opdateret streamlit_app_hybrid.py — indholdet er en komplet erstatning)
+"""
+streamlit_app_hybrid.py
+
+KB-first mail-besvarelse app — with robust YAML loader, preview persistence, feedback-save (CSV primary),
+and a "Download feedback" button (adds ability to download feedback/feedback.csv and feedback/feedback.xlsx).
+"""
 from typing import List, Dict, Any, Tuple
 import os, re, json, ssl, urllib.request, traceback, time
 from datetime import datetime
@@ -374,7 +379,6 @@ def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_pa
     except Exception as e:
         return False, f"Failed to save feedback: {e}"
 
-# Generation
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
                             faq_rows: List[Dict[str,str]] = None,
@@ -437,6 +441,25 @@ else:
             st.sidebar.text_area("assistant_config (parsed)", value=json.dumps(assistant_config, ensure_ascii=False, indent=2), height=200)
         except Exception:
             st.sidebar.text_area("assistant_config (repr)", value=str(assistant_config)[:4000], height=200)
+
+# -- Download feedback button(s) in sidebar --
+if os.path.exists(FEEDBACK_CSV):
+    try:
+        with open(FEEDBACK_CSV, "rb") as fh:
+            csv_bytes = fh.read()
+        st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke forberede CSV download: {e}")
+else:
+    st.sidebar.write("Ingen feedback CSV fundet endnu.")
+
+if os.path.exists(FEEDBACK_XLSX):
+    try:
+        with open(FEEDBACK_XLSX, "rb") as fh:
+            xlsx_bytes = fh.read()
+        st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke forberede XLSX download: {e}")
 
 # Main UI flow (form)
 programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS_KB_DEFAULT))
@@ -539,13 +562,10 @@ if st.session_state.get("previewed"):
         ok, msg = save_feedback_row(row, FEEDBACK_CSV, FEEDBACK_XLSX)
         if ok:
             st.success("Feedback gemt. " + msg)
-            # schedule clearing of feedback fields on next run (avoid direct session assignment while widgets exist)
             st.session_state["feedback_clear_pending"] = True
-            # Try to rerun; if experimental_rerun is unavailable or raises, fall back to st.stop()
             try:
                 st.experimental_rerun()
             except Exception:
-                # experimental_rerun not available — stop execution; pending clear will run at top of next run
                 st.stop()
         else:
             st.error(msg)
