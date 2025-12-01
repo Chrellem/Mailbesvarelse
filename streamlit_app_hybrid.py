@@ -1,16 +1,44 @@
 """
 streamlit_app_hybrid.py
 
-KB-first mail-besvarelse app — with robust YAML loader, preview persistence, feedback-save (CSV primary),
-and a "Download feedback" button (adds ability to download feedback/feedback.csv and feedback/feedback.xlsx).
+KB-first mail-besvarelse app — updated feedback schema & UI.
+
+Changes in this version (per request):
+- Removed subject field from the main form and from feedback storage.
+- Feedback CSV/XLSX schema and saved rows now start with these columns (in order):
+    1) "Mail"                  (original mail body)
+    2) "Genereret svar"        (generated reply body)
+    3) "feedback_text"
+    4) "rating"
+    5) "program_detected"
+    6) "assistant_instruction"
+  Additional metadata columns follow (timestamp_utc, model, temperature, top_p, confidence).
+- Added a "Reset feedback storage" button in the sidebar that deletes existing feedback files
+  and creates a new CSV with the updated header. (You said resetting is fine.)
+- Kept CSV as primary storage (append) and XLSX update as best-effort.
+- Preserved previous behavior: preview persistence, YAML config loader, debug messages, downloads.
+
+Usage:
+- Replace your existing streamlit_app_hybrid.py with this file.
+- Press "Reset feedback storage" in the sidebar once if you want to recreate the file with new schema.
+- Otherwise new saves will append with the new schema; resetting ensures only the new columns exist.
 """
 from typing import List, Dict, Any, Tuple
-import os, re, json, ssl, urllib.request, traceback, time
+import os
+import re
+import json
+import ssl
+import urllib.request
+import traceback
+import time
 from datetime import datetime
+from collections import OrderedDict
+
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+# optional
 try:
     import yaml
 except Exception:
@@ -28,6 +56,7 @@ except Exception:
 
 load_dotenv()
 
+# ---------------- Defaults / Config ----------------
 PROGRAMS_KB_DEFAULT = "sheets/Programmes.xlsx"
 FAQ_KB_DEFAULT = "sheets/faq_kb.xlsx"
 ASSISTANT_CONFIG_DEFAULT = "config/assistant_config.yaml"
@@ -40,11 +69,24 @@ FEEDBACK_DIR = "feedback"
 FEEDBACK_CSV = os.path.join(FEEDBACK_DIR, "feedback.csv")
 FEEDBACK_XLSX = os.path.join(FEEDBACK_DIR, "feedback.xlsx")
 
+# Desired leading feedback columns and their order/labels
+FEEDBACK_LEADING_COLUMNS = [
+    "Mail",  # original mail body
+    "Genereret svar",  # generated reply body
+    "feedback_text",
+    "rating",
+    "program_detected",
+    "assistant_instruction"
+]
+# Additional metadata columns appended after the leading ones
+FEEDBACK_METADATA_COLUMNS = ["timestamp_utc", "model", "temperature", "top_p", "confidence"]
+
 st.set_page_config(page_title="Mailbesvarelse — KB-driven", layout="wide")
 st.title("Mail‑besvarelse — KB‑driven (Program + FAQ)")
 
-# If a previous run requested clearing feedback, do it now (before widgets are created)
+# ---------------- Early session handling (clear pending) ----------------
 if st.session_state.get("feedback_clear_pending"):
+    # Clear feedback widgets before they are created to avoid Streamlit widget-state errors
     st.session_state["feedback_text_input"] = ""
     st.session_state["feedback_rating"] = ""
     try:
@@ -52,7 +94,7 @@ if st.session_state.get("feedback_clear_pending"):
     except Exception:
         pass
 
-# Sidebar
+# ---------------- Sidebar UI ----------------
 st.sidebar.header("Konfiguration")
 st.sidebar.text_input("Programmes KB path", value=PROGRAMS_KB_DEFAULT, key="programs_kb_path")
 st.sidebar.text_input("FAQ KB path", value=FAQ_KB_DEFAULT, key="faq_kb_path")
@@ -70,6 +112,23 @@ assistant_prompt_ui = st.sidebar.text_area(
 if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
+# Reset feedback storage (user allowed reset)
+st.sidebar.markdown("### Feedback storage")
+if st.sidebar.button("Reset feedback storage (recreate files with new schema)"):
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        # create empty dataframe with desired header
+        cols = FEEDBACK_LEADING_COLUMNS + FEEDBACK_METADATA_COLUMNS
+        df = pd.DataFrame(columns=cols)
+        df.to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
+        try:
+            df.to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
+        except Exception:
+            pass
+        st.sidebar.success(f"Feedback files reset. New CSV created at {FEEDBACK_CSV}")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke reset feedback storage: {e}")
+
 if st.sidebar.button("Reload assistant config now"):
     try:
         load_assistant_config_with_mtime.clear()
@@ -81,6 +140,26 @@ if st.sidebar.button("Reload assistant config now"):
         except Exception:
             st.sidebar.info("Genstart app for at sikre genindlæsning.")
 
+# Download buttons for feedback files if present
+if os.path.exists(FEEDBACK_CSV):
+    try:
+        with open(FEEDBACK_CSV, "rb") as fh:
+            csv_bytes = fh.read()
+        st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke forberede CSV download: {e}")
+else:
+    st.sidebar.write("Ingen feedback CSV fundet endnu.")
+
+if os.path.exists(FEEDBACK_XLSX):
+    try:
+        with open(FEEDBACK_XLSX, "rb") as fh:
+            xlsx_bytes = fh.read()
+        st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke forberede XLSX download: {e}")
+
+# ---------------- Read OPENAI key ----------------
 OPENAI_API_KEY = None
 try:
     if isinstance(st.secrets, dict):
@@ -100,7 +179,7 @@ if openai is not None and OPENAI_API_KEY:
     except Exception:
         pass
 
-# YAML loader (mtime aware)
+# ---------------- YAML loader (mtime-aware) ----------------
 @st.cache_data(ttl=3600)
 def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
@@ -145,7 +224,7 @@ def load_assistant_config(path: str) -> Dict[str, Any]:
         mtime = time.time()
     return load_assistant_config_with_mtime(path, mtime)
 
-# Helpers
+# ---------------- Helpers (extract, chat completion, KB loaders) ----------------
 def extract_text_from_response_json(j: Any) -> str:
     texts: List[str] = []
     def recurse(o: Any):
@@ -273,6 +352,7 @@ def load_faq_kb(path: str) -> List[Dict[str, str]]:
         })
     return out
 
+# ---------------- Matching utilities ----------------
 def detect_language(text: str) -> str:
     t = (text or "").lower()
     danish_tokens = ["hej", "tak", "venlig", "venligst", "hvordan", "hvad", "jeg", "ikke"]
@@ -359,13 +439,19 @@ def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict
             parts.append(f"- Q: {q}\n  A: {snippet}")
     return "\n".join(parts)
 
-# Save feedback row (CSV primary, XLSX best-effort)
+# ---------------- Save feedback row (CSV primary, XLSX best-effort) ----------------
 def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_path: str = FEEDBACK_XLSX) -> Tuple[bool, str]:
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     try:
+        # Ensure the CSV exists with correct header if not present
+        if not os.path.exists(csv_path):
+            # create DataFrame with header in desired order
+            cols = FEEDBACK_LEADING_COLUMNS + FEEDBACK_METADATA_COLUMNS
+            pd.DataFrame(columns=cols).to_csv(csv_path, index=False, encoding="utf-8")
+        # Append the new row; maintain column order by using OrderedDict
         df_row = pd.DataFrame([row])
-        write_header = not os.path.exists(csv_path)
-        df_row.to_csv(csv_path, mode="a", header=write_header, index=False, encoding="utf-8")
+        df_row.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
+        # Try to also maintain XLSX (best effort)
         try:
             if os.path.exists(xlsx_path):
                 existing = pd.read_excel(xlsx_path, engine="openpyxl")
@@ -379,6 +465,7 @@ def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_pa
     except Exception as e:
         return False, f"Failed to save feedback: {e}"
 
+# ---------------- Generation using YAML instruction ----------------
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
                             faq_rows: List[Dict[str,str]] = None,
@@ -423,7 +510,7 @@ def generate_combined_reply(mail_text: str,
                 pass
     return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Kunne ikke parse JSON fra model; se body"}
 
-# Sidebar parsed config display
+# ---------------- Sidebar parsed config display ----------------
 st.sidebar.markdown("### Assistant config (YAML)")
 assistant_config_path = st.session_state.get("assistant_config_path", ASSISTANT_CONFIG_DEFAULT)
 assistant_config = load_assistant_config(assistant_config_path)
@@ -442,41 +529,28 @@ else:
         except Exception:
             st.sidebar.text_area("assistant_config (repr)", value=str(assistant_config)[:4000], height=200)
 
-# -- Download feedback button(s) in sidebar --
-if os.path.exists(FEEDBACK_CSV):
-    try:
-        with open(FEEDBACK_CSV, "rb") as fh:
-            csv_bytes = fh.read()
-        st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
-    except Exception as e:
-        st.sidebar.error(f"Kunne ikke forberede CSV download: {e}")
-else:
-    st.sidebar.write("Ingen feedback CSV fundet endnu.")
-
-if os.path.exists(FEEDBACK_XLSX):
-    try:
-        with open(FEEDBACK_XLSX, "rb") as fh:
-            xlsx_bytes = fh.read()
-        st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception as e:
-        st.sidebar.error(f"Kunne ikke forberede XLSX download: {e}")
-
-# Main UI flow (form)
+# ---------------- Main UI / flow ----------------
 programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS_KB_DEFAULT))
 faq_kb = load_faq_kb(st.session_state.get("faq_kb_path", FAQ_KB_DEFAULT))
 
 st.subheader("Indtast mail til analyse")
+
+# Note: subject removed per request — only body (mail content)
 with st.form("email_form"):
-    subject = st.text_input("Subject", value="")
-    body = st.text_area("Body", value="", height=260)
+    body = st.text_area("Mail (indsæt hele beskeden her)", value="", height=300)
     submitted = st.form_submit_button("Preview svar")
 
+# When previewed, persist generated reply and metadata in session_state
 if submitted:
+    # clear some transient debug keys
     for k in ["last_messages_sent", "assistant_raw_response"]:
         if k in st.session_state:
             del st.session_state[k]
-    combined = f"{subject}\n\n{body}"
+
+    combined = body or ""
     st.session_state["last_mail_text"] = combined
+
+    # language + detection
     language = detect_language(combined)
     program_candidates = detect_programs(combined, programs_kb, top_n=4) if programs_kb else []
     uddannelses_relateret = False
@@ -485,16 +559,22 @@ if submitted:
         uddannelses_relateret = True
         top_row = program_candidates[0][0]
         selected_program_rows = select_program_rows(top_row.get("programme"), programs_kb)
+
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
+
+    # instruction & params
     assistant_instruction_to_use = None
     if assistant_config and isinstance(assistant_config, dict):
         assistant_instruction_to_use = assistant_config.get("instruction")
     if not assistant_instruction_to_use:
         assistant_instruction_to_use = st.session_state.get("assistant_prompt", None)
+
     used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.2
     used_top_p = float(assistant_config.get("top_p")) if assistant_config and assistant_config.get("top_p") is not None else 1.0
     used_model = assistant_config.get("model") or DEFAULT_MODEL
+
+    # generate
     reply = generate_combined_reply(combined,
                                     program_rows=selected_program_rows if uddannelses_relateret else None,
                                     faq_rows=faq_to_use,
@@ -503,20 +583,23 @@ if submitted:
                                     assistant_instruction=assistant_instruction_to_use,
                                     temperature=used_temp,
                                     top_p=used_top_p)
+
+    # persist preview info
     st.session_state["previewed"] = True
     st.session_state["last_generated_reply"] = reply
     st.session_state["last_generated_meta"] = {
-        "mail_subject": subject or "",
-        "mail_body": body or "",
+        "mail_body": combined,
         "program_detected": selected_program_rows[0]['programme'] if selected_program_rows else "",
         "model": used_model,
         "temperature": used_temp,
         "top_p": used_top_p,
         "assistant_instruction": (assistant_instruction_to_use or "")[:4000]
     }
+    # ensure feedback inputs exist in session
     st.session_state["feedback_text_input"] = st.session_state.get("feedback_text_input", "")
     st.session_state["feedback_rating"] = st.session_state.get("feedback_rating", "")
 
+# Show previewed content + feedback UI if previewed
 if st.session_state.get("previewed"):
     reply = st.session_state.get("last_generated_reply", {})
     meta = st.session_state.get("last_generated_meta", {})
@@ -525,43 +608,48 @@ if st.session_state.get("previewed"):
         st.markdown(f"**Uddannelse relateret: JA — valgt program:** {program_name}")
     else:
         st.markdown("**Uddannelse relateret: NEJ**")
-    subj = reply.get("subject") or (f"Vedr. din henvendelse om {program_name}" if program_name else "Vedr. din henvendelse")
-    body_out = reply.get("body") or ""
-    st.text_input("Suggested subject (edit):", value=subj, key="reply_subj")
-    st.text_area("Suggested body (edit):", value=body_out, height=360, key="reply_body")
+
+    # Show generated body only (subject removed)
+    generated_body = reply.get("body") or ""
+    st.markdown("**Genereret svar (rediger hvis nødvendigt):**")
+    st.text_area("Genereret svar (edit)", value=generated_body, height=360, key="reply_body")
+
     st.markdown(f"**Generation params:** model={meta.get('model')}, temperature={meta.get('temperature')}, top_p={meta.get('top_p')}")
     st.markdown(f"**Confidence (model estimate):** {reply.get('confidence', 0):.2f}")
     if reply.get("notes"):
         st.info(f"Notes: {reply.get('notes')}")
+
+    # Feedback UI
     st.markdown("### Feedback på dette svar")
     feedback_text = st.text_area("Skriv din feedback her", value=st.session_state.get("feedback_text_input", ""), height=160, key="feedback_text_input")
     rating = st.selectbox("Vurder svar (valgfrit)", options=["", "1 - meget utilfreds", "2", "3", "4", "5 - meget tilfreds"], index=0, key="feedback_rating")
+
     if st.button("Gem feedback", key="save_feedback_btn"):
-        mail_subject_orig = meta.get("mail_subject", "")
         mail_body_orig = meta.get("mail_body", "")
-        generated_subject = st.session_state.get("reply_subj", subj)
-        generated_body = st.session_state.get("reply_body", body_out)
+        generated_body_current = st.session_state.get("reply_body", generated_body)
         confidence = reply.get("confidence") if isinstance(reply.get("confidence"), (int, float)) else reply.get("confidence", "")
         program_name = meta.get("program_detected", "")
         timestamp = datetime.utcnow().isoformat() + "Z"
-        row = {
-            "timestamp_utc": timestamp,
-            "mail_subject": mail_subject_orig,
-            "mail_body": mail_body_orig,
-            "generated_subject": generated_subject,
-            "generated_body": generated_body,
-            "confidence": confidence,
-            "program_detected": program_name,
-            "model": meta.get("model", ""),
-            "temperature": meta.get("temperature", ""),
-            "top_p": meta.get("top_p", ""),
-            "assistant_instruction": meta.get("assistant_instruction", ""),
-            "feedback_text": feedback_text or "",
-            "rating": rating or ""
-        }
-        ok, msg = save_feedback_row(row, FEEDBACK_CSV, FEEDBACK_XLSX)
+
+        # Build row with desired column order (OrderedDict to preserve order)
+        od = OrderedDict()
+        od["Mail"] = mail_body_orig
+        od["Genereret svar"] = generated_body_current
+        od["feedback_text"] = feedback_text or ""
+        od["rating"] = rating or ""
+        od["program_detected"] = program_name
+        od["assistant_instruction"] = meta.get("assistant_instruction", "")
+        # metadata appended
+        od["timestamp_utc"] = timestamp
+        od["model"] = meta.get("model", "")
+        od["temperature"] = meta.get("temperature", "")
+        od["top_p"] = meta.get("top_p", "")
+        od["confidence"] = confidence
+
+        ok, msg = save_feedback_row(dict(od), FEEDBACK_CSV, FEEDBACK_XLSX)
         if ok:
             st.success("Feedback gemt. " + msg)
+            # schedule clearing of feedback input on next run and rerun safely
             st.session_state["feedback_clear_pending"] = True
             try:
                 st.experimental_rerun()
@@ -569,6 +657,8 @@ if st.session_state.get("previewed"):
                 st.stop()
         else:
             st.error(msg)
+
+    # messages debug
     messages_debug = st.session_state.get("last_messages_sent")
     if messages_debug:
         st.markdown("**Messages sent to model (debug)**")
@@ -576,8 +666,9 @@ if st.session_state.get("previewed"):
             st.text_area("messages", value=json.dumps(messages_debug, ensure_ascii=False, indent=2), height=200)
         except Exception:
             st.text_area("messages (repr)", value=str(messages_debug)[:4096], height=200)
+
 else:
-    st.info("Indtast mail og klik Preview svar for automatisk svarudkast.")
+    st.info("Indtast mail i 'Mail' feltet og klik Preview svar for automatisk svarudkast.")
 
 st.write("---")
-st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation. Use the feedback box to save examples to feedback/feedback.csv.")
+st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation. Feedback saved to feedback/feedback.csv (and XLSX best-effort).")
