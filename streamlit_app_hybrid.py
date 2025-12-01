@@ -1,4 +1,4 @@
-# (Filen er en komplet erstatning. Jeg har udeladt kommentarer for at holde den overskuelig.)
+# (Opdateret streamlit_app_hybrid.py — indholdet er en komplet erstatning)
 from typing import List, Dict, Any, Tuple
 import os, re, json, ssl, urllib.request, traceback, time
 from datetime import datetime
@@ -140,7 +140,7 @@ def load_assistant_config(path: str) -> Dict[str, Any]:
         mtime = time.time()
     return load_assistant_config_with_mtime(path, mtime)
 
-# Helpers (extract_text, chat completion, KB loaders, matching)
+# Helpers
 def extract_text_from_response_json(j: Any) -> str:
     texts: List[str] = []
     def recurse(o: Any):
@@ -354,6 +354,7 @@ def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict
             parts.append(f"- Q: {q}\n  A: {snippet}")
     return "\n".join(parts)
 
+# Save feedback row (CSV primary, XLSX best-effort)
 def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_path: str = FEEDBACK_XLSX) -> Tuple[bool, str]:
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     try:
@@ -373,6 +374,7 @@ def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_pa
     except Exception as e:
         return False, f"Failed to save feedback: {e}"
 
+# Generation
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
                             faq_rows: List[Dict[str,str]] = None,
@@ -539,8 +541,12 @@ if st.session_state.get("previewed"):
             st.success("Feedback gemt. " + msg)
             # schedule clearing of feedback fields on next run (avoid direct session assignment while widgets exist)
             st.session_state["feedback_clear_pending"] = True
-            # trigger rerun so the pending clear is executed before widgets render
-            st.experimental_rerun()
+            # Try to rerun; if experimental_rerun is unavailable or raises, fall back to st.stop()
+            try:
+                st.experimental_rerun()
+            except Exception:
+                # experimental_rerun not available — stop execution; pending clear will run at top of next run
+                st.stop()
         else:
             st.error(msg)
     messages_debug = st.session_state.get("last_messages_sent")
