@@ -84,39 +84,6 @@ if st.session_state.get("feedback_clear_pending"):
         del st.session_state["feedback_clear_pending"]
     except Exception:
         pass
-st.markdown(
-    """
-    <style>
-    /* Try to match common Reset button labels used in the app (covers variants) */
-    button[title="Reset feedback storage (create new CSV with correct header)"],
-    button[title="Reset feedback storage (local CSV + sheets if enabled)"],
-    button[title="Reset feedback storage (recreate files with new schema)"],
-    button[title^="Reset feedback storage"] {
-      background-color: #ff6b6b !important;
-      color: #fff !important;
-      border: 1px solid #cc0000 !important;
-      box-shadow: none !important;
-    }
-    button[title^="Reset feedback storage"]:hover {
-      background-color: #e64545 !important;
-    }
-
-    /* If the button doesn't expose title attribute in this Streamlit version,
-       also style sidebar buttons that contain the Reset text (best-effort).
-       This may affect other buttons with 'Reset feedback' text if present. */
-    .stSidebar button {
-      /* no blanket styling here to avoid side-effects */
-    }
-
-    /* Small extra: emphasize the Reset section header in sidebar */
-    .stSidebar div[role="list"] > div:has(button[title^="Reset feedback storage"]) > p {
-      color: #b00020;
-      font-weight: 600;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 # ---------------- Sidebar UI ----------------
 st.sidebar.header("Konfiguration")
