@@ -1,9 +1,11 @@
 """
 streamlit_app_hybrid.py
 
-KB-first mail-besvarelse app (patched).
-Patch: load_assistant_config bruger filens mtime som cache-key, så ændringer i config/assistant_config.yaml
-automatisk fører til genindlæsning. Der er også en reload-knap som rydder cache.
+KB-first mail-besvarelse app (mtime-aware YAML loader).
+
+Patch: Når brugeren indsætter et nyt spørgsmål og trykker Preview, rydder vi
+midlertidige session_state-keys (fx tidligere svar, debug messages) så appen
+ikke "husker" gamle svar. Vi bevarer assistant_instruction cache og config.
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -44,7 +46,7 @@ FAQ_KB_DEFAULT = "sheets/faq_kb.xlsx"
 ASSISTANT_CONFIG_DEFAULT = "config/assistant_config.yaml"
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-PROGRAM_DETECT_THRESHOLD = float(os.getenv("PROGRAM_DETECT_THRESHOLD", "5.0"))
+PROGRAM_DETECT_THRESHOLD = float(os.getenv("PROGRAM_DETECT_THRESHOLD", "2.5"))
 FAQ_MATCH_TOPK = int(os.getenv("FAQ_MATCH_TOPK", "3"))
 KB_SNIPPET_MAX_CHARS = 800
 
@@ -70,12 +72,16 @@ if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
 if st.sidebar.button("Reload assistant config now"):
-    # clear all st.cache_data caches (robust)
+    # clear cached loader
     try:
-        st.cache_data.clear()
-        st.sidebar.success("Cache ryddet — config genindlæses ved næste handling.")
+        load_assistant_config_with_mtime.clear()
+        st.sidebar.success("Config cache ryddet — vil genindlæse ved næste handling.")
     except Exception:
-        st.sidebar.error("Kunne ikke rydde cache programmatisk; genstart app for at tvinge reload.")
+        try:
+            st.cache_data.clear()
+            st.sidebar.success("Cache ryddet via st.cache_data.clear().")
+        except Exception:
+            st.sidebar.info("Genstart app for at sikre genindlæsning.")
 
 # Read OPENAI key from st.secrets or environment
 OPENAI_API_KEY = None
@@ -99,7 +105,6 @@ if openai is not None and OPENAI_API_KEY:
         pass
 
 # ---------------- Robust YAML loader (mtime-aware cache key) ----------------
-# Note: st.cache_data caches based on function args; we include file mtime so changes force reload.
 @st.cache_data(ttl=3600)
 def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     """
@@ -117,7 +122,6 @@ def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
         return {"_parse_error": "PyYAML not installed"}
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            # support multi-document but merge them (later docs override earlier)
             docs = list(yaml.safe_load_all(fh))
     except Exception as e:
         return {"_parse_error": str(e)}
@@ -151,11 +155,8 @@ def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
 
     return out
 
-# Convenience wrapper that computes mtime and calls cached loader
 def load_assistant_config(path: str) -> Dict[str, Any]:
-    if not path:
-        return {}
-    if not os.path.exists(path):
+    if not path or not os.path.exists(path):
         return {}
     try:
         mtime = os.path.getmtime(path)
@@ -474,6 +475,15 @@ with st.form("email_form"):
 if not submitted:
     st.info("Indtast mail og klik Preview svar for automatisk svarudkast.")
 else:
+    # When a new preview is requested, clear transient session keys to avoid showing previous outputs.
+    transient_keys = [
+        "reply_subj", "reply_body", "last_messages_sent", "assistant_raw_response",
+        "last_generated_reply", "last_mail_text"
+    ]
+    for k in transient_keys:
+        if k in st.session_state:
+            del st.session_state[k]
+
     combined = f"{subject}\n\n{body}"
     st.session_state["last_mail_text"] = combined
 
@@ -533,14 +543,11 @@ else:
                                         temperature=used_temp,
                                         top_p=used_top_p)
 
-    # show messages that were sent for debugging (if present)
-    messages_debug = st.session_state.get("last_messages_sent")
-    if messages_debug:
-        st.markdown("**Messages sent to model (debug)**")
-        try:
-            st.text_area("messages", value=json.dumps(messages_debug, ensure_ascii=False, indent=2), height=200)
-        except Exception:
-            st.text_area("messages (repr)", value=str(messages_debug)[:4096], height=200)
+    # persist last generated reply for potential inspection
+    try:
+        st.session_state["last_generated_reply"] = reply
+    except Exception:
+        pass
 
     no_program_match = (not uddannelses_relateret)
     no_faq_match = len(faq_to_use) == 0
@@ -558,19 +565,13 @@ else:
         st.text_input("Suggested subject (edit):", value=clarification_subject, key="clarify_subj")
         st.text_area("Suggested body (edit):", value=clarification_body, height=260, key="clarify_body")
     else:
-        subj = ""
-        body_out = ""
-        if reply:
-            subj = reply.get("subject") or ""
-            body_out = reply.get("body") or ""
-        if not subj:
-            subj = f"Vedr. din henvendelse om {selected_program_rows[0]['programme']}" if selected_program_rows else "Vedr. din henvendelse"
+        subj = reply.get("subject") or (f"Vedr. din henvendelse om {selected_program_rows[0]['programme']}" if selected_program_rows else "Vedr. din henvendelse")
+        body_out = reply.get("body") or ""
         st.text_input("Suggested subject (edit):", value=subj, key="reply_subj")
         st.text_area("Suggested body (edit):", value=body_out, height=360, key="reply_body")
-        if reply:
-            st.markdown(f"**Confidence (model estimate):** {reply.get('confidence', 0):.2f}")
-            if reply.get("notes"):
-                st.info(f"Notes: {reply.get('notes')}")
+        st.markdown(f"**Confidence (model estimate):** {reply.get('confidence', 0):.2f}")
+        if reply.get("notes"):
+            st.info(f"Notes: {reply.get('notes')}")
 
 st.write("---")
 st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation.")
