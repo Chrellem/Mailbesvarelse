@@ -1,27 +1,18 @@
+# streamlit_app_hybrid.py
 """
-streamlit_app_hybrid.py
+KB-first mail-besvarelse app — feedback schema updated.
 
-KB-first mail-besvarelse app — updated feedback schema & UI.
-
-Changes in this version (per request):
-- Removed subject field from the main form and from feedback storage.
-- Feedback CSV/XLSX schema and saved rows now start with these columns (in order):
-    1) "Mail"                  (original mail body)
-    2) "Genereret svar"        (generated reply body)
-    3) "feedback_text"
-    4) "rating"
-    5) "program_detected"
-    6) "assistant_instruction"
-  Additional metadata columns follow (timestamp_utc, model, temperature, top_p, confidence).
-- Added a "Reset feedback storage" button in the sidebar that deletes existing feedback files
-  and creates a new CSV with the updated header. (You said resetting is fine.)
-- Kept CSV as primary storage (append) and XLSX update as best-effort.
-- Preserved previous behavior: preview persistence, YAML config loader, debug messages, downloads.
-
-Usage:
-- Replace your existing streamlit_app_hybrid.py with this file.
-- Press "Reset feedback storage" in the sidebar once if you want to recreate the file with new schema.
-- Otherwise new saves will append with the new schema; resetting ensures only the new columns exist.
+Feedback CSV schema (new file created by "Reset feedback storage"):
+Columns in order:
+A: Mail                 (mail_body)
+B: Svar                 (generated_body)
+C: feedback_text
+D: rating
+E: assistant_instruction
+F: generated_subject
+G: program_detected
+H: timestamp_utc        (UTC+1, ISO 8601 with +01:00)
+Then: model, temperature, top_p, confidence
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -31,14 +22,13 @@ import ssl
 import urllib.request
 import traceback
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# optional
 try:
     import yaml
 except Exception:
@@ -69,17 +59,18 @@ FEEDBACK_DIR = "feedback"
 FEEDBACK_CSV = os.path.join(FEEDBACK_DIR, "feedback.csv")
 FEEDBACK_XLSX = os.path.join(FEEDBACK_DIR, "feedback.xlsx")
 
-# Desired leading feedback columns and their order/labels
-FEEDBACK_LEADING_COLUMNS = [
-    "Mail",  # original mail body
-    "Genereret svar",  # generated reply body
+# Leading columns in exact order requested
+LEADING_COLUMNS = [
+    "Mail",               # mail_body
+    "Svar",               # generated_body
     "feedback_text",
     "rating",
+    "assistant_instruction",
+    "generated_subject",
     "program_detected",
-    "assistant_instruction"
+    "timestamp_utc"
 ]
-# Additional metadata columns appended after the leading ones
-FEEDBACK_METADATA_COLUMNS = ["timestamp_utc", "model", "temperature", "top_p", "confidence"]
+METADATA_COLUMNS = ["model", "temperature", "top_p", "confidence"]
 
 st.set_page_config(page_title="Mailbesvarelse — KB-driven", layout="wide")
 st.title("Mail‑besvarelse — KB‑driven (Program + FAQ)")
@@ -112,33 +103,32 @@ assistant_prompt_ui = st.sidebar.text_area(
 if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
-# Reset feedback storage (user allowed reset)
+# Reset feedback storage (start fresh)
 st.sidebar.markdown("### Feedback storage")
-if st.sidebar.button("Reset feedback storage (recreate files with new schema)"):
+if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
     try:
         os.makedirs(FEEDBACK_DIR, exist_ok=True)
-        # create empty dataframe with desired header
-        cols = FEEDBACK_LEADING_COLUMNS + FEEDBACK_METADATA_COLUMNS
-        df = pd.DataFrame(columns=cols)
-        df.to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
+        cols = LEADING_COLUMNS + METADATA_COLUMNS
+        pd.DataFrame(columns=cols).to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
         try:
-            df.to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
+            pd.DataFrame(columns=cols).to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
         except Exception:
+            # XLSX best-effort
             pass
-        st.sidebar.success(f"Feedback files reset. New CSV created at {FEEDBACK_CSV}")
+        st.sidebar.success(f"Feedback storage reset. New CSV at {FEEDBACK_CSV}")
     except Exception as e:
-        st.sidebar.error(f"Kunne ikke reset feedback storage: {e}")
+        st.sidebar.error(f"Could not reset feedback storage: {e}")
 
 if st.sidebar.button("Reload assistant config now"):
     try:
         load_assistant_config_with_mtime.clear()
-        st.sidebar.success("Config cache ryddet — vil genindlæse ved næste handling.")
+        st.sidebar.success("Config cache cleared — will reload on next action.")
     except Exception:
         try:
             st.cache_data.clear()
-            st.sidebar.success("Cache ryddet via st.cache_data.clear().")
+            st.sidebar.success("Cache cleared via st.cache_data.clear().")
         except Exception:
-            st.sidebar.info("Genstart app for at sikre genindlæsning.")
+            st.sidebar.info("Restart app to ensure reload.")
 
 # Download buttons for feedback files if present
 if os.path.exists(FEEDBACK_CSV):
@@ -147,9 +137,9 @@ if os.path.exists(FEEDBACK_CSV):
             csv_bytes = fh.read()
         st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
     except Exception as e:
-        st.sidebar.error(f"Kunne ikke forberede CSV download: {e}")
+        st.sidebar.error(f"Could not prepare CSV download: {e}")
 else:
-    st.sidebar.write("Ingen feedback CSV fundet endnu.")
+    st.sidebar.write("No feedback CSV found yet.")
 
 if os.path.exists(FEEDBACK_XLSX):
     try:
@@ -157,7 +147,7 @@ if os.path.exists(FEEDBACK_XLSX):
             xlsx_bytes = fh.read()
         st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
-        st.sidebar.error(f"Kunne ikke forberede XLSX download: {e}")
+        st.sidebar.error(f"Could not prepare XLSX download: {e}")
 
 # ---------------- Read OPENAI key ----------------
 OPENAI_API_KEY = None
@@ -443,15 +433,17 @@ def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict
 def save_feedback_row(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, xlsx_path: str = FEEDBACK_XLSX) -> Tuple[bool, str]:
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     try:
-        # Ensure the CSV exists with correct header if not present
+        # Ensure CSV exists with header in desired order
         if not os.path.exists(csv_path):
-            # create DataFrame with header in desired order
-            cols = FEEDBACK_LEADING_COLUMNS + FEEDBACK_METADATA_COLUMNS
+            cols = LEADING_COLUMNS + METADATA_COLUMNS
             pd.DataFrame(columns=cols).to_csv(csv_path, index=False, encoding="utf-8")
-        # Append the new row; maintain column order by using OrderedDict
-        df_row = pd.DataFrame([row])
+        # Append row preserving order: build DataFrame with columns matching file
+        file_cols = LEADING_COLUMNS + METADATA_COLUMNS
+        df_row = pd.DataFrame([row], columns=row.keys())
+        # If df_row doesn't include all file_cols, reindex so columns match file order (missing columns will be NaN)
+        df_row = df_row.reindex(columns=file_cols)
         df_row.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8")
-        # Try to also maintain XLSX (best effort)
+        # Try to update xlsx as best-effort
         try:
             if os.path.exists(xlsx_path):
                 existing = pd.read_excel(xlsx_path, engine="openpyxl")
@@ -534,19 +526,15 @@ programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS
 faq_kb = load_faq_kb(st.session_state.get("faq_kb_path", FAQ_KB_DEFAULT))
 
 st.subheader("Indtast mail til analyse")
-
-# Note: subject removed per request — only body (mail content)
 with st.form("email_form"):
     body = st.text_area("Mail (indsæt hele beskeden her)", value="", height=300)
     submitted = st.form_submit_button("Preview svar")
 
-# When previewed, persist generated reply and metadata in session_state
 if submitted:
-    # clear some transient debug keys
+    # clear transient debug keys
     for k in ["last_messages_sent", "assistant_raw_response"]:
         if k in st.session_state:
             del st.session_state[k]
-
     combined = body or ""
     st.session_state["last_mail_text"] = combined
 
@@ -593,9 +581,9 @@ if submitted:
         "model": used_model,
         "temperature": used_temp,
         "top_p": used_top_p,
-        "assistant_instruction": (assistant_instruction_to_use or "")[:4000]
+        "assistant_instruction": (assistant_instruction_to_use or "")[:4000],
+        "generated_subject": reply.get("subject", "") if isinstance(reply, dict) else ""
     }
-    # ensure feedback inputs exist in session
     st.session_state["feedback_text_input"] = st.session_state.get("feedback_text_input", "")
     st.session_state["feedback_rating"] = st.session_state.get("feedback_rating", "")
 
@@ -609,7 +597,9 @@ if st.session_state.get("previewed"):
     else:
         st.markdown("**Uddannelse relateret: NEJ**")
 
-    # Show generated body only (subject removed)
+    # Show generated subject and body (editable)
+    generated_subject = meta.get("generated_subject", "") or reply.get("subject", "")
+    st.text_input("Genereret emne (edit)", value=generated_subject, key="reply_subj")
     generated_body = reply.get("body") or ""
     st.markdown("**Genereret svar (rediger hvis nødvendigt):**")
     st.text_area("Genereret svar (edit)", value=generated_body, height=360, key="reply_body")
@@ -627,20 +617,23 @@ if st.session_state.get("previewed"):
     if st.button("Gem feedback", key="save_feedback_btn"):
         mail_body_orig = meta.get("mail_body", "")
         generated_body_current = st.session_state.get("reply_body", generated_body)
+        generated_subject_current = st.session_state.get("reply_subj", generated_subject)
         confidence = reply.get("confidence") if isinstance(reply.get("confidence"), (int, float)) else reply.get("confidence", "")
         program_name = meta.get("program_detected", "")
-        timestamp = datetime.utcnow().isoformat() + "Z"
-
-        # Build row with desired column order (OrderedDict to preserve order)
+        # timestamp in UTC+1
+        now_utc1 = datetime.now(timezone.utc) + timedelta(hours=1)
+        timestamp = now_utc1.isoformat()
+        # Build OrderedDict with exact leading order requested
         od = OrderedDict()
         od["Mail"] = mail_body_orig
-        od["Genereret svar"] = generated_body_current
+        od["Svar"] = generated_body_current
         od["feedback_text"] = feedback_text or ""
         od["rating"] = rating or ""
-        od["program_detected"] = program_name
         od["assistant_instruction"] = meta.get("assistant_instruction", "")
-        # metadata appended
+        od["generated_subject"] = generated_subject_current
+        od["program_detected"] = program_name
         od["timestamp_utc"] = timestamp
+        # append metadata (order not required)
         od["model"] = meta.get("model", "")
         od["temperature"] = meta.get("temperature", "")
         od["top_p"] = meta.get("top_p", "")
@@ -671,4 +664,4 @@ else:
     st.info("Indtast mail i 'Mail' feltet og klik Preview svar for automatisk svarudkast.")
 
 st.write("---")
-st.caption("Logic: detect programme → lookup Programmes.xlsx → supplement with faq_kb.xlsx → load assistant config (YAML) → inject as assistant-role → final chat completion generation. Feedback saved to feedback/feedback.csv (and XLSX best-effort).")
+st.caption("Feedback saved to feedback/feedback.csv (XLSX best-effort). Use 'Reset feedback storage' to start from a new document with the specified columns.")
