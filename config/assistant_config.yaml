@@ -79,7 +79,7 @@ reminder: >
   qualifications.  
   Each output must contain both an internal assessment and a well-structured response in the same
   language as the incoming message. Always include the required greeting and closing, and limit
-  the content strictly to what is stated in the codebase.
+  the content strictly to what is stated in the codebase. Always include greeting and closing. 
 
 temperature: 1.0
 top_p: 0.2
