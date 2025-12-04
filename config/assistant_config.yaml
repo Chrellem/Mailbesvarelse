@@ -15,7 +15,7 @@ instruction: |
     - "Avoid including any processes, documents, or rules that are not explicitly described in the code."
     - "Always first assess what information the codebase actually contains before providing an answer."
     - "Each email response must consist of: Internal assessment → Response to applicant."
-    - "Use all relevant information available in the code to provide a fully comprehensive answer. Do not shorten or omit details that are present in the code, and do not add information from outside it."
+   
 
 
   output_format:
