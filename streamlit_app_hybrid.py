@@ -2,12 +2,12 @@
 streamlit_app_hybrid.py
 
 Stable app version with:
-- KB loaders for Excel/CSV (Programmes + FAQ).
-- detect_language heuristic.
-- Single-shot generator (uses YAML instruction if present; optional checkbox to enforce YAML-only).
-- Fixed create_chat_completion to read OPENAI key from environment or st.secrets at call-time
-  (avoids NameError if key variable isn't present in global scope).
-- Local feedback saving and sidebar controls.
+- KB loaders for Excel/CSV (Programmes + FAQ)
+- detect_language heuristic
+- YAML-only assistant prompt (no UI fallback used)
+- Reload assistant config button that clears cache and updates prompt immediately
+- Reset app state button to clear preview/messages without full page reload
+- Local feedback saving and sidebar controls
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -67,35 +67,39 @@ st.sidebar.text_input("Assistant config path (YAML)", value=ASSISTANT_CONFIG_DEF
 st.sidebar.text_input("OpenAI model (env default)", value=DEFAULT_MODEL, key="openai_model")
 st.sidebar.write("Program detection threshold:", PROGRAM_DETECT_THRESHOLD)
 
-st.sidebar.markdown("### Assistant prompt (fallback)")
+# NOTE: UI fallback field remains visible but is ignored (YAML-only requested)
+st.sidebar.markdown("### Assistant prompt (ignored - YAML only)")
 assistant_prompt_ui = st.sidebar.text_area(
-    "Assistant prompt (fallback). Bruges hvis YAML ikke findes eller er tom.",
+    "Assistant prompt (VISUAL ONLY, not used). Du har bedt om YAML-only.",
     value=st.session_state.get("assistant_prompt", ""),
     height=120,
     key="assistant_prompt_input"
 )
 if assistant_prompt_ui is not None:
+    # keep value for editing convenience, but we will NOT use it for generation
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
-# New: option to force YAML-only prompt (no fallback).
-# The checkbox widget already writes into session_state under key="use_yaml_only".
-use_yaml_only = st.sidebar.checkbox(
-    "Use YAML only for assistant prompt (no fallback)",
-    value=st.session_state.get("use_yaml_only", False),
-    key="use_yaml_only"
-)
-# NOTE: Do not assign st.session_state["use_yaml_only"] again here.
-
+# Buttons: reload config and reset app state
 if st.sidebar.button("Reload assistant config now"):
-    try:
-        load_assistant_config_with_mtime.clear()
-        st.sidebar.success("Config cache ryddet.")
-    except Exception:
-        try:
-            st.cache_data.clear()
-            st.sidebar.success("st.cache_data cleared.")
-        except Exception:
-            st.sidebar.info("Genstart app for fuld reload.")
+    # Mark that we want to force cache clear and reload
+    st.session_state["force_reload_config"] = True
+    # Clear previous preview/messages so new config is used immediately
+    keys_to_clear = ["previewed", "last_generated_reply", "last_generated_meta", "last_messages_sent", "last_mail_text"]
+    for k in keys_to_clear:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.sidebar.success("Config reload scheduled. Try at køre en ny Preview (ingen fuld page reload nødvendig).")
+
+if st.sidebar.button("Reset app (clear preview & messages)"):
+    # Clear relevant session-state keys only
+    keys_to_clear = [
+        "previewed", "last_generated_reply", "last_generated_meta", "last_messages_sent",
+        "last_mail_text", "feedback_text_input", "feedback_rating"
+    ]
+    for k in keys_to_clear:
+        if k in st.session_state:
+            del st.session_state[k]
+    st.sidebar.success("App state ryddet (preview & messages).")
 
 # Reset feedback storage
 if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
@@ -177,6 +181,21 @@ def load_assistant_config_with_mtime(path: str, mtime: float) -> Dict[str, Any]:
     return out
 
 def load_assistant_config(path: str) -> Dict[str, Any]:
+    """
+    Load assistant config; respects st.session_state['force_reload_config'] which,
+    if set, clears the cache just before loading so file changes are taken immediately.
+    """
+    if st.session_state.get("force_reload_config"):
+        try:
+            load_assistant_config_with_mtime.clear()
+        except Exception:
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+        # reset the flag
+        del st.session_state["force_reload_config"]
+
     if not path or not os.path.exists(path):
         return {}
     try:
@@ -266,10 +285,6 @@ def load_faq_kb(path: str) -> List[Dict[str, str]]:
 
 # ---------------- Language detection (heuristic) ----------------
 def detect_language(text: str) -> str:
-    """
-    Heuristic offline detector returning 'da' or 'en'.
-    Conservative: returns 'en' only if english signals > danish signals; otherwise 'da'.
-    """
     if not text:
         return "da"
     t = (text or "").lower()
@@ -343,17 +358,12 @@ def create_chat_completion(messages: List[Dict[str, str]],
                            max_tokens: int = 400,
                            temperature: float = 0.2,
                            top_p: float = 1.0) -> Tuple[str, Any]:
-    """
-    Call OpenAI using SDK if available; otherwise use REST.
-    Resolves API key at call-time from st.secrets or environment to avoid NameError.
-    """
     model = model or DEFAULT_MODEL
     OPENAI_API_KEY = _get_openai_key()
 
     # Try SDK path if openai package present
     if openai is not None and OPENAI_API_KEY:
         try:
-            # Some OpenAI SDK variants expect openai.api_key, others use OpenAI class
             try:
                 openai.api_key = OPENAI_API_KEY
             except Exception:
@@ -374,7 +384,6 @@ def create_chat_completion(messages: List[Dict[str, str]],
                     text = str(resp)
                 return text, resp
             else:
-                # older openai sdk
                 try:
                     resp = openai.ChatCompletion.create(
                         model=model,
@@ -388,10 +397,9 @@ def create_chat_completion(messages: List[Dict[str, str]],
                 except Exception:
                     pass
         except Exception:
-            # fall through to REST
             pass
 
-    # REST fallback — require API key
+    # REST fallback
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not available for REST fallback.")
     url = "https://api.openai.com/v1/chat/completions"
@@ -436,11 +444,19 @@ def generate_combined_reply(mail_text: str,
         f"Reply in {lang_name}. Output must be a single JSON object with keys: subject, body, confidence (0-1), notes."
     )
     messages = [{"role": "system", "content": base_system}]
-    instr = assistant_instruction or st.session_state.get("assistant_prompt", None)
+
+    # ASSISTANT INSTRUCTION: YAML-only (no fallback)
+    instr = assistant_instruction or ""  # assistant_instruction must be provided (YAML)
     if instr:
         messages.append({"role": "assistant", "content": instr})
+    else:
+        # If YAML missing, instruct user in sidebar (we already show an error there),
+        # but still proceed with system prompt only (empty assistant instruction).
+        pass
+
     user = f"Mail:\n'''{mail_text}'''\n\nKB block:\n{kb_block}\n\nInstructions:\n- Answer the most important question first.\n- If the mail refers to a specific programme, refer to it by name.\n- Keep the reply concise and practical.\n- If KB is insufficient, ask one clear follow-up question.\nReturn only JSON."
     messages.append({"role": "user", "content": user})
+
     try:
         st.session_state["last_messages_sent"] = messages
     except Exception:
@@ -546,20 +562,16 @@ if submitted:
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
 
-    # Assistant instruction selection respecting "use_yaml_only" checkbox
+    # Load assistant config (respects force_reload_config flag)
     assistant_instruction_to_use = None
     assistant_config = load_assistant_config(st.session_state.get("assistant_config_path", ASSISTANT_CONFIG_DEFAULT))
     if assistant_config and isinstance(assistant_config, dict):
         assistant_instruction_to_use = assistant_config.get("instruction")
 
+    # YAML-only: if instruction missing, show error in sidebar and set empty instruction
     if not assistant_instruction_to_use:
-        if st.session_state.get("use_yaml_only"):
-            # YAML enforced but missing: show error and set to empty string to avoid fallback
-            st.sidebar.error("YAML missing key 'instruction' eller fil ikke fundet. Tjek 'Assistant config path' eller slå 'Use YAML only' fra.")
-            assistant_instruction_to_use = ""
-        else:
-            # legacy behavior: use session_state fallback
-            assistant_instruction_to_use = st.session_state.get("assistant_prompt", None)
+        st.sidebar.error("YAML mangler 'instruction' nøgle eller fil ikke fundet. Indsæt prompt i YAML.")
+        assistant_instruction_to_use = ""
 
     used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.2
     used_top_p = float(assistant_config.get("top_p")) if assistant_config and assistant_config.get("top_p") is not None else 1.0
