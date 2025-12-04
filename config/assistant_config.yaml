@@ -60,6 +60,6 @@ instruction: |
     provides before answering. Output must always be in English and include:
     internal assessment + response to applicant.
 
-temperature: 1.5
-top_p: 0.5
+temperature: 1.0
+top_p: 0.2
 model: "gpt-3.5-turbo"
