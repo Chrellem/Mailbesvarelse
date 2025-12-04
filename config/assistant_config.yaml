@@ -37,6 +37,7 @@ output_format:
       documentation procedures, exceptions, conditions, and next steps.
       Avoid vague summaries or overly brief answers.
 
+
 example:
   incoming_email: "I wish to transfer my ECTS to one of your university bachelor programs to complete my graduation."
   output:
@@ -45,26 +46,26 @@ example:
       from international universities. All applicants must apply through the standard
       admissions process. It also specifies that ECTS credits earned previously may be
       assessed for transfer after admission, based on submitted documentation.
-      Therefore, the applicant response should clearly explain both policies, use the fixed
-      greeting and closing, and clarify what the applicant can expect regarding recognition of prior learning.
-    response_to_applicant: >
-      Dear Applicant,  
-      Thank you for your interest in Aarhus University.  
+      Therefore, the applicant response should clearly explain both policies and follow the fixed structure.
+    response_to_applicant:
+      greeting: >
+        Dear Applicant,  
+        Thank you for your interest in Aarhus University.  
+      body: >
+        Aarhus University does not offer direct transfer pathways from international universities.  
+        To pursue a bachelor’s degree at Aarhus University, you must apply through the standard
+        admissions process for the programme of your choice.  
 
-      Aarhus University does not offer direct transfer pathways from international universities.  
-      To pursue a bachelor’s degree at Aarhus University, you must apply through the standard
-      admissions process for the programme of your choice.  
+        Please note that previously earned ECTS credits can only be assessed for possible transfer
+        after you have been admitted to a programme.  
+        The assessment is based entirely on the documentation you provide—this includes official transcripts,
+        detailed course descriptions, and any other academic materials that may be requested.  
 
-      Please note that previously earned ECTS credits can only be assessed for possible transfer
-      after you have been admitted to a programme.  
-      The assessment is based entirely on the documentation you provide—this includes official transcripts,
-      detailed course descriptions, and any other academic materials that may be requested.  
-
-      The university does not guarantee the transferability of credits in advance.  
-
-      I hope this answers your question.  
-      Kind regards,  
-      [Name], Admissions Team
+        The university does not guarantee the transferability of credits in advance.  
+      closing: >
+        I hope this clarifies your question.  
+        Kind regards,  
+        [Name], Admissions Team
 
 important_considerations:
   - "All responses must be grounded in the official codebase—no external sources or assumptions."
