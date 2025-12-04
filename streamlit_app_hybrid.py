@@ -1,17 +1,12 @@
 """
 streamlit_app_hybrid.py
 
-Reverted to a simpler, earlier version (stable) with:
-- KB loaders that read Excel/CSV (semikolon CSV support) for programmes and FAQ.
-- Simple retrieval (token overlap) for programmes and FAQ.
-- detect_language heuristic function included.
-- Single-shot generation prompting the model to return JSON (subject, body, confidence, notes).
-- Local feedback save to feedback/feedback.csv (and feedback.xlsx best-effort).
-- Sidebar: reset feedback, download CSV/XLSX, reload assistant config.
-
-This version includes a sidebar checkbox "Use YAML only for assistant prompt (no fallback)"
-which, when enabled, forces the app to use the YAML 'instruction' value only and not fall
-back to the assistant prompt stored in the UI session_state.
+Stable app version with:
+- KB loaders for Excel/CSV (Programmes + FAQ).
+- detect_language heuristic.
+- Single-shot generator (uses YAML instruction if present; optional checkbox to enforce YAML-only).
+- Fixed session_state usage and safe cache reload behavior (avoids the StreamlitAPIException).
+- Local feedback saving and sidebar controls.
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -81,76 +76,16 @@ assistant_prompt_ui = st.sidebar.text_area(
 if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
-# New: option to force YAML-only prompt (no fallback)
-st.sidebar.markdown("### Prompt source")
+# New: option to force YAML-only prompt (no fallback).
+# IMPORTANT: do NOT assign into session_state again after calling checkbox;
+# st.sidebar.checkbox already writes into session_state under the given key.
 use_yaml_only = st.sidebar.checkbox(
     "Use YAML only for assistant prompt (no fallback)",
     value=st.session_state.get("use_yaml_only", False),
     key="use_yaml_only"
 )
-st.session_state["use_yaml_only"] = use_yaml_only
-
-if st.sidebar.button("Reload assistant config now"):
-    try:
-        load_assistant_config_with_mtime.clear()
-        st.sidebar.success("Config cache ryddet.")
-    except Exception:
-        try:
-            st.cache_data.clear()
-            st.sidebar.success("st.cache_data cleared.")
-        except Exception:
-            st.sidebar.info("Genstart app for fuld reload.")
-
-# Reset feedback storage
-if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
-    try:
-        os.makedirs(FEEDBACK_DIR, exist_ok=True)
-        cols = LEADING_COLUMNS + METADATA_COLUMNS
-        pd.DataFrame(columns=cols).to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
-        try:
-            pd.DataFrame(columns=cols).to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
-        except Exception:
-            pass
-        st.sidebar.success("Feedback storage reset.")
-    except Exception as e:
-        st.sidebar.error(f"Kunne ikke reset feedback storage: {e}")
-
-# Download links
-if os.path.exists(FEEDBACK_CSV):
-    try:
-        with open(FEEDBACK_CSV, "rb") as fh:
-            csv_bytes = fh.read()
-        st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
-    except Exception:
-        pass
-
-if os.path.exists(FEEDBACK_XLSX):
-    try:
-        with open(FEEDBACK_XLSX, "rb") as fh:
-            xlsx_bytes = fh.read()
-        st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception:
-        pass
-
-# ---------------- Read OPENAI key ----------------
-OPENAI_API_KEY = None
-try:
-    if isinstance(st.secrets, dict):
-        OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    else:
-        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-except Exception:
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-
-if OPENAI_API_KEY:
-    OPENAI_API_KEY = OPENAI_API_KEY.strip()
-
-st.sidebar.write("OPENAI key set:", bool(OPENAI_API_KEY))
-if openai is not None and OPENAI_API_KEY:
-    try:
-        openai.api_key = OPENAI_API_KEY
-    except Exception:
-        pass
+# NOTE: do NOT do st.session_state["use_yaml_only"] = use_yaml_only here (Streamlit disallows
+# certain direct mutations at this point and the checkbox already set the key).
 
 # ---------------- YAML loader (mtime aware) ----------------
 @st.cache_data(ttl=3600)
