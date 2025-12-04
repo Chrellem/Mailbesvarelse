@@ -71,6 +71,7 @@ reminder: >
   available policy, followed by a response written in the applicant’s language. Responses must begin and end with
   the predefined text, and must only contain content documented in the official codebase.
 
+max_response_depth: "High"
 temperature: 1.0
 top_p: 0.2
 model: "gpt-3.5-turbo"
