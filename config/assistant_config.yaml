@@ -81,9 +81,6 @@ reminder: >
   language as the incoming message. Always include the required greeting and closing, and limit
   the content strictly to what is stated in the codebase. Always include greeting and closing.
 
-model_behavior:
-  max_response_depth: "High"
-  allow_format_override: false
 
 temperature: 1.0
 top_p: 0.2
