@@ -1,20 +1,19 @@
 """
 streamlit_app_hybrid.py
 
-Complete Streamlit app with improved retrieval and stricter KB-grounded generation.
+Complete Streamlit app with:
+- KB loaders that read Excel/CSV (semikolon CSV support) for programmes and FAQ.
+- Improved retrieval (fuzzy/TF-IDF fallback) and language detection.
+- Split-into-subquestions strategy: answer each sub-question from KB when possible,
+  return aggregated reply + provenance for each part.
+- Feedback saved locally to feedback/feedback.csv (XLSX best-effort).
+- Sidebar: reset feedback, download CSV/XLSX, reload assistant config.
 
-Features:
-- Reads Programmes and FAQ from Excel (.xlsx/.xls) or semicolon CSV.
-- Improved program detection (fuzzy/token overlap) and FAQ matching (TF-IDF fallback).
-- Strict generation function that forces the model to only use KB snippets,
-  requires the model to return used_kb_ids, and post-validates grounding.
-- Saves feedback locally to feedback/feedback.csv with exact column order:
-    Mail, Svar, feedback_text, rating, assistant_instruction, generated_subject,
-    program_detected, timestamp_utc (UTC+1), then metadata model, temperature, top_p, confidence
-- Sidebar: reset feedback (no password), download CSV/XLSX, reload assistant config.
-- Works without extra packages; installing rapidfuzz and scikit-learn improves retrieval quality.
+Notes:
+- If you previously installed rapidfuzz and scikit-learn, retrieval quality improves.
+- Put OPENAI_API_KEY (if used) in environment or st.secrets.
+- Keep Programmes.xlsx and faq_kb.xlsx in sheets/ or update sidebar paths.
 """
-
 from typing import List, Dict, Any, Tuple
 import os
 import re
@@ -448,129 +447,256 @@ def create_chat_completion(messages: List[Dict[str, str]],
         text = json.dumps(j)[:2000]
     return text, j
 
-# ---------------- Strict KB-only generation (improved) ----------------
-def generate_combined_reply(mail_text: str,
-                            program_rows: List[Dict[str,str]] = None,
-                            faq_rows: List[Dict[str,str]] = None,
-                            language: str = "da",
-                            openai_model: str = None,
-                            assistant_instruction: str = None,
-                            temperature: float = 0.0,
-                            top_p: float = 1.0,
-                            kb_max_chars: int = 2000) -> Dict[str, Any]:
-    model = openai_model or DEFAULT_MODEL
-    kb_items = []
-    if program_rows:
-        for r in program_rows:
-            rid = str(r.get("id") or r.get("ID") or (r.get("programme") or "")[:60])
-            prog = r.get("programme", "")
-            adm = r.get("admission", "")
-            text = f"PROGRAM|{rid}|{prog}\nADMISSION: {adm}"
-            kb_items.append({"id": rid, "type": "program", "text": text})
-    if faq_rows:
-        for r in faq_rows:
-            rid = str(r.get("id") or r.get("ID") or "")
-            q = r.get("question", "")
-            a = r.get("answer", "")
-            text = f"FAQ|{rid}|Q: {q}\nA: {a}"
-            kb_items.append({"id": rid, "type": "faq", "text": text})
-    kb_concat = ""
-    used_kb_texts = []
-    for it in kb_items:
-        snippet = it["text"]
-        if len(kb_concat) + len(snippet) + 50 > kb_max_chars:
-            continue
-        kb_concat += f"\n---\nID:{it['id']}\n{snippet}\n"
-        used_kb_texts.append((it['id'], snippet))
-    lang_name = "dansk" if language == "da" else "english"
-    base_system = (
-        f"You are a strict KB-grounded assistant answering in {lang_name}. "
-        "YOU MUST ONLY use facts present in the 'KB block' provided below. "
-        "If the KB does not contain enough information, respond with one short clarification question. "
-        "You MUST return exactly one JSON object and nothing else, with keys: "
-        "\"subject\" (string), \"body\" (string), \"confidence\" (0-1), \"notes\" (string), and \"used_kb_ids\" (array of ids). "
-        "The 'body' must be fully supported by the KB and must not include invented content."
-    )
-    messages = [{"role": "system", "content": base_system}]
-    if assistant_instruction:
-        messages.append({"role": "assistant", "content": assistant_instruction})
-    user_msg = f"Mail:\n'''{mail_text}'''\n\nKB block (only use info here):\n{kb_concat}\n\nReturn only the JSON object as specified."
-    messages.append({"role": "user", "content": user_msg})
-    try:
-        st.session_state["last_messages_sent"] = messages
-    except Exception:
-        pass
-    try:
-        out_text, resp = create_chat_completion(messages, model=model, max_tokens=700, temperature=temperature, top_p=top_p)
-    except Exception as e:
-        return {"subject": "", "body": f"Fejl ved opkald til model: {e}", "confidence": 0.0, "notes": "LLM call failed", "used_kb_ids": []}
-    parsed = None
-    try:
-        parsed = json.loads(out_text)
-    except Exception:
-        m = re.search(r'(\{[\s\S]*\})', out_text)
-        if m:
-            try:
-                parsed = json.loads(m.group(1))
-            except Exception:
-                parsed = None
-    if not parsed or not isinstance(parsed, dict):
-        return {
-            "subject": "",
-            "body": "Jeg har ikke tilstrækkelig information i vidensbasen til at besvare dette. Kan du uddybe?",
-            "confidence": 0.0,
-            "notes": "Model response not valid JSON or didn't follow KB-only format.",
-            "used_kb_ids": []
-        }
-    used_ids = parsed.get("used_kb_ids", [])
-    if not isinstance(used_ids, list):
-        used_ids = []
-    allowed_ids = set(it[0] for it in used_kb_texts)
-    invalid_ids = [i for i in used_ids if str(i) not in allowed_ids]
-    if invalid_ids:
-        return {
-            "subject": "",
-            "body": "Jeg kan ikke besvare dette ud fra de tilgængelige oplysninger i vidensbasen. Kan du give flere oplysninger?",
-            "confidence": 0.0,
-            "notes": f"Model cited KB ids not provided: {invalid_ids}",
-            "used_kb_ids": []
-        }
-    body_text = parsed.get("body", "") or ""
-    if not body_text.strip():
-        return {
-            "subject": parsed.get("subject", ""),
-            "body": "Jeg har ikke nok information i KB til at svare — venligst præcisér dit spørgsmål.",
-            "confidence": 0.0,
-            "notes": "Empty body from model.",
-            "used_kb_ids": used_ids
-        }
-    kb_union_text = " ".join([s for (_id, s) in used_kb_texts])
-    body_tokens = set(_word_tokens(body_text))
-    kb_tokens = set(_word_tokens(kb_union_text))
-    if not body_tokens:
-        grounding_ratio = 0.0
+# ---------------- Split + per-part KB helpers (new) ----------------
+# Tunables
+MIN_KB_SCORE = 0.1
+KB_MAX_CHARS_PER_PART = 1600
+SUBQUESTION_MIN_LEN = 20
+
+def split_into_subquestions(text: str) -> List[str]:
+    if not text or not text.strip():
+        return []
+    t = text.strip()
+    parts = []
+    if "?" in t:
+        raw = re.split(r'(\?)', t)
+        for i in range(0, len(raw), 2):
+            sentence = raw[i].strip()
+            qmark = raw[i+1] if i+1 < len(raw) else ""
+            candidate = (sentence + qmark).strip()
+            if candidate:
+                parts.append(candidate)
     else:
-        grounding_ratio = len(body_tokens & kb_tokens) / len(body_tokens)
-    if grounding_ratio < 0.45:
-        return {
-            "subject": "",
-            "body": "Jeg kan ikke besvare dette ud fra de tilgængelige oplysninger i vidensbasen. Kan du uddybe?",
-            "confidence": 0.0,
-            "notes": f"Answer not sufficiently grounded in KB (grounding_ratio={grounding_ratio:.2f}).",
-            "used_kb_ids": used_ids
-        }
+        raw = re.split(r'\n+|•|- |;{1,2}', t)
+        for r in raw:
+            s = r.strip()
+            if s:
+                parts.append(s)
+        if len(parts) <= 1:
+            raw2 = re.split(r'(?<=[\.\!\?])\s+', t)
+            parts = [p.strip() for p in raw2 if p.strip()]
+    merged = []
+    for p in parts:
+        if len(p) < SUBQUESTION_MIN_LEN and merged:
+            merged[-1] = (merged[-1] + " " + p).strip()
+        else:
+            merged.append(p)
+    unique = []
+    seen = set()
+    for p in merged:
+        q = " ".join(p.split())
+        if len(q) >= 5 and q.lower() not in seen:
+            unique.append(q)
+            seen.add(q.lower())
+    return unique
+
+def build_kb_for_subquestion(subq: str,
+                             programs_kb: List[Dict[str,str]],
+                             faq_kb: List[Dict[str,str]],
+                             top_prog: int = 2,
+                             top_faq: int = 3) -> Tuple[str, List[Tuple[str,str]]]:
+    kb_concat = ""
+    used = []
+    prog_hits = []
     try:
-        conf = float(parsed.get("confidence", 0.0))
-        conf = max(0.0, min(1.0, conf))
+        prog_hits = detect_programs(subq, programs_kb, top_n=top_prog) if programs_kb else []
     except Exception:
-        conf = 0.0
-    return {
-        "subject": parsed.get("subject", "") or "",
-        "body": body_text,
-        "confidence": conf,
-        "notes": parsed.get("notes", "") or "",
-        "used_kb_ids": used_ids
+        prog_hits = []
+    for (row, score) in prog_hits:
+        if score < MIN_KB_SCORE:
+            continue
+        rid = str(row.get("id") or row.get("ID") or (row.get("programme") or "")[:40])
+        title = row.get("programme") or row.get("program") or ""
+        adm = row.get("admission") or ""
+        snippet = adm.strip()[:800]
+        block = f"PROGRAM|{rid}|{title}\nADMISSION: {snippet}"
+        if (rid, snippet) not in used:
+            used.append((rid, snippet))
+            kb_concat += f"\n---\nID:{rid}\n{block}\n"
+        if len(kb_concat) > KB_MAX_CHARS_PER_PART:
+            break
+    faq_hits = []
+    try:
+        faq_hits = match_faq(subq, faq_kb, top_k=top_faq) if faq_kb else []
+    except Exception:
+        faq_hits = []
+    for (row, score) in faq_hits:
+        if score < MIN_KB_SCORE:
+            continue
+        rid = str(row.get("id") or row.get("ID") or "")
+        q = (row.get("question") or "")[:200]
+        a = (row.get("answer") or "")[:800]
+        block = f"FAQ|{rid}|Q: {q}\nA: {a}"
+        if (rid, a) not in used:
+            used.append((rid, a))
+            kb_concat += f"\n---\nID:{rid}\n{block}\n"
+        if len(kb_concat) > KB_MAX_CHARS_PER_PART:
+            break
+    return kb_concat.strip(), used
+
+def map_used_kb_ids_to_sources(used_ids: List[str],
+                               programs_kb: List[Dict[str,str]],
+                               faq_kb: List[Dict[str,str]]) -> List[Dict[str,str]]:
+    sources = []
+    if not used_ids:
+        return sources
+    prog_map = {}
+    for r in (programs_kb or []):
+        key = str(r.get("id") or r.get("ID") or r.get("programme","")).strip()
+        if key:
+            prog_map[key] = r
+    faq_map = {}
+    for r in (faq_kb or []):
+        key = str(r.get("id") or r.get("ID") or "").strip()
+        if key:
+            faq_map[key] = r
+    for uid in used_ids:
+        u = str(uid)
+        if u in prog_map:
+            r = prog_map[u]
+            sources.append({"id": u, "type": "program", "title": r.get("programme",""), "snippet": (r.get("admission") or "")[:300]})
+        elif u in faq_map:
+            r = faq_map[u]
+            sources.append({"id": u, "type": "faq", "title": r.get("question",""), "snippet": (r.get("answer") or "")[:300]})
+        else:
+            sources.append({"id": u, "type": "unknown", "title": "", "snippet": ""})
+    return sources
+
+# ---------------- Split-aware generation (replaces previous single-shot generator) ----------------
+def generate_combined_reply_split_parts(mail_text: str,
+                                        program_rows: List[Dict[str,str]] = None,
+                                        faq_rows: List[Dict[str,str]] = None,
+                                        language: str = "da",
+                                        openai_model: str = None,
+                                        assistant_instruction: str = None,
+                                        temperature: float = 0.0,
+                                        top_p: float = 1.0) -> Dict[str, Any]:
+    model = openai_model or DEFAULT_MODEL
+    subqs = split_into_subquestions(mail_text)
+    if not subqs:
+        subqs = [mail_text.strip()] if mail_text else []
+    parts_out = []
+    confidences = []
+    aggregate_subjects = []
+    for idx, subq in enumerate(subqs, start=1):
+        part = {"question": subq, "answer": "", "confidence": 0.0, "used_kb_ids": [], "used_sources": [], "status": "no_kb"}
+        kb_concat, used_pairs = build_kb_for_subquestion(subq, program_rows or [], faq_rows or [])
+        if not kb_concat:
+            part["answer"] = "Jeg har ikke nok dokumenteret information i den tilgængelige vidensbase til at besvare dette delspørgsmål. Kan du give flere oplysninger?"
+            part["status"] = "no_kb"
+            part["confidence"] = 0.0
+            parts_out.append(part)
+            continue
+        kb_ids = [str(u[0]) for u in used_pairs]
+        lang_name = "dansk" if language == "da" else "english"
+        base_system = (
+            f"You are a strict KB-grounded assistant answering in {lang_name}. "
+            "YOU MUST ONLY use facts present in the 'KB block' provided below. "
+            "If the KB does not contain enough information to answer, respond with one short clarification question. "
+            "You MUST return exactly one JSON object and nothing else, with keys: "
+            "\"subject\" (string), \"body\" (string), \"confidence\" (0-1), \"notes\" (string), and \"used_kb_ids\" (array of ids). "
+            "The 'body' must be fully supported by the KB and must not include invented content."
+        )
+        messages = [{"role": "system", "content": base_system}]
+        if assistant_instruction:
+            messages.append({"role": "assistant", "content": assistant_instruction})
+        user_msg = f"Subquestion:\n'''{subq}'''\n\nKB block (only use information from here):\n{kb_concat}\n\nReturn only the JSON object specified."
+        messages.append({"role": "user", "content": user_msg})
+        try:
+            out_text, resp = create_chat_completion(messages, model=model, max_tokens=600, temperature=temperature, top_p=top_p)
+        except Exception as e:
+            part["answer"] = f"Fejl ved modelkald: {e}"
+            part["confidence"] = 0.0
+            part["status"] = "error"
+            parts_out.append(part)
+            continue
+        parsed = None
+        try:
+            parsed = json.loads(out_text)
+        except Exception:
+            m = re.search(r'(\{[\s\S]*\})', out_text)
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                except Exception:
+                    parsed = None
+        if not parsed or not isinstance(parsed, dict):
+            part["answer"] = "Modelen svarede ikke i det forventede format; kan du præcisere delspørgsmålet?"
+            part["confidence"] = 0.0
+            part["status"] = "clarify_needed"
+            parts_out.append(part)
+            continue
+        used_ids = parsed.get("used_kb_ids", [])
+        if not isinstance(used_ids, list):
+            used_ids = []
+        used_sources = map_used_kb_ids_to_sources(used_ids, program_rows or [], faq_rows or [])
+        if not used_sources:
+            part["answer"] = "Modelen angav ingen anvendte kilder fra vidensbasen; kan du uddybe?"
+            part["confidence"] = 0.0
+            part["status"] = "clarify_needed"
+            parts_out.append(part)
+            continue
+        body_text = parsed.get("body", "") or ""
+        if not body_text.strip():
+            part["answer"] = "Modelen producerede tomt svar; kan du præcisere?"
+            part["confidence"] = 0.0
+            part["status"] = "clarify_needed"
+            parts_out.append(part)
+            continue
+        kb_union_text = " ".join([s for (_id, s) in used_pairs])
+        body_tokens = set(_word_tokens(body_text))
+        kb_tokens = set(_word_tokens(kb_union_text))
+        grounding_ratio = 0.0
+        if body_tokens:
+            grounding_ratio = len(body_tokens & kb_tokens) / len(body_tokens)
+        if grounding_ratio < 0.35:
+            part["answer"] = "Svaret ser ikke ud til primært at være baseret på den tilgængelige vidensbase. Kan du give mere kontekst?"
+            part["confidence"] = 0.0
+            part["status"] = "clarify_needed"
+            parts_out.append(part)
+            continue
+        part["answer"] = body_text
+        try:
+            conf_val = float(parsed.get("confidence", 0.0))
+            conf_val = max(0.0, min(1.0, conf_val))
+        except Exception:
+            conf_val = 0.0
+        part["confidence"] = conf_val
+        part["used_kb_ids"] = used_ids
+        part["used_sources"] = used_sources
+        part["status"] = "answered"
+        parts_out.append(part)
+        confidences.append(conf_val)
+        subj = parsed.get("subject", "") or ""
+        if subj:
+            aggregate_subjects.append(subj)
+    if confidences:
+        avg_conf = sum(confidences) / len(confidences)
+    else:
+        avg_conf = 0.0
+    body_lines = []
+    for i, p in enumerate(parts_out, start=1):
+        heading = f"Del {i}: {p['question']}"
+        body_lines.append(heading)
+        body_lines.append("- Svar:")
+        body_lines.append(p["answer"])
+        if p.get("used_sources"):
+            body_lines.append("- Kilder:")
+            for s in p["used_sources"]:
+                typ = s.get("type", "unknown")
+                title = s.get("title", "")
+                snippet = s.get("snippet", "")
+                body_lines.append(f"  - [{typ}] {title} (id={s.get('id')}) — \"{snippet[:160]}\"")
+        body_lines.append("")
+    aggregated_subject = " | ".join([s for s in aggregate_subjects if s]) or (parts_out[0]["question"][:80] if parts_out else "")
+    out = {
+        "subject": aggregated_subject,
+        "body": "\n".join(body_lines).strip(),
+        "confidence": round(avg_conf, 3),
+        "notes": f"{len(parts_out)} parts processed; {sum(1 for p in parts_out if p['status']=='answered')} answered from KB.",
+        "parts": parts_out
     }
+    return out
 
 # ---------------- build_kb_block for context display ----------------
 def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict[str,str]] = None) -> str:
@@ -661,16 +787,15 @@ if submitted:
     used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.0
     used_top_p = float(assistant_config.get("top_p")) if assistant_config and assistant_config.get("top_p") is not None else 1.0
     used_model = assistant_config.get("model") or DEFAULT_MODEL
-    # Use stricter generation: temperature default 0.0 to reduce hallucinations
-    reply = generate_combined_reply(combined,
-                                    program_rows=selected_program_rows if uddannelses_relateret else None,
-                                    faq_rows=faq_to_use,
-                                    language=language,
-                                    openai_model=used_model,
-                                    assistant_instruction=assistant_instruction_to_use,
-                                    temperature=used_temp if used_temp is not None else 0.0,
-                                    top_p=used_top_p if used_top_p is not None else 1.0,
-                                    kb_max_chars=2000)
+    # Use split-aware generator (stricter KB grounding)
+    reply = generate_combined_reply_split_parts(combined,
+                                               program_rows=selected_program_rows if uddannelses_relateret else None,
+                                               faq_rows=faq_to_use,
+                                               language=language,
+                                               openai_model=used_model,
+                                               assistant_instruction=assistant_instruction_to_use,
+                                               temperature=used_temp if used_temp is not None else 0.0,
+                                               top_p=used_top_p if used_top_p is not None else 1.0)
     st.session_state["previewed"] = True
     st.session_state["last_generated_reply"] = reply
     st.session_state["last_generated_meta"] = {
@@ -703,6 +828,14 @@ if st.session_state.get("previewed"):
     st.markdown(f"**Confidence (model estimate):** {reply.get('confidence', 0):.2f}")
     if reply.get("notes"):
         st.info(f"Notes: {reply.get('notes')}")
+    # Show parts provenance if present
+    parts = reply.get("parts", [])
+    if parts:
+        st.markdown("### Parts and provenance (debug)")
+        try:
+            st.text_area("parts", value=json.dumps(parts, ensure_ascii=False, indent=2), height=300)
+        except Exception:
+            st.text_area("parts (repr)", value=str(parts)[:4096], height=300)
     st.markdown("### Feedback på dette svar")
     feedback_text = st.text_area("Skriv din feedback her", value=st.session_state.get("feedback_text_input", ""), height=160, key="feedback_text_input")
     rating = st.selectbox("Vurder svar (valgfrit)", options=["", "1 - meget utilfreds", "2", "3", "4", "5 - meget tilfreds"], index=0, key="feedback_rating")
