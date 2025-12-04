@@ -80,9 +80,10 @@ reminder: >
   Each output must contain both an internal assessment and a well-structured response in the same
   language as the incoming message. Always include the required greeting and closing, and limit
   the content strictly to what is stated in the codebase. Always include greeting and closing.
-  Your task is to generate full, detailed, and accurate responses regardless of how brief or vague the incoming question is.
-  You must always assume max_response_depth is set to "High" — elaborate on all relevant points found in the codebase.
 
+model_behavior:
+  max_response_depth: "High"
+  allow_format_override: false
 
 temperature: 1.0
 top_p: 0.2
