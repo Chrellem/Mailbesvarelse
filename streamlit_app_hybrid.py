@@ -5,7 +5,8 @@ Stable app version with:
 - KB loaders for Excel/CSV (Programmes + FAQ).
 - detect_language heuristic.
 - Single-shot generator (uses YAML instruction if present; optional checkbox to enforce YAML-only).
-- Fixed session_state usage and safe cache reload behavior (avoids the StreamlitAPIException).
+- Fixed create_chat_completion to read OPENAI key from environment or st.secrets at call-time
+  (avoids NameError if key variable isn't present in global scope).
 - Local feedback saving and sidebar controls.
 """
 from typing import List, Dict, Any, Tuple
@@ -77,15 +78,67 @@ if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
 # New: option to force YAML-only prompt (no fallback).
-# IMPORTANT: do NOT assign into session_state again after calling checkbox;
-# st.sidebar.checkbox already writes into session_state under the given key.
+# The checkbox widget already writes into session_state under key="use_yaml_only".
 use_yaml_only = st.sidebar.checkbox(
     "Use YAML only for assistant prompt (no fallback)",
     value=st.session_state.get("use_yaml_only", False),
     key="use_yaml_only"
 )
-# NOTE: do NOT do st.session_state["use_yaml_only"] = use_yaml_only here (Streamlit disallows
-# certain direct mutations at this point and the checkbox already set the key).
+# NOTE: Do not assign st.session_state["use_yaml_only"] again here.
+
+if st.sidebar.button("Reload assistant config now"):
+    try:
+        load_assistant_config_with_mtime.clear()
+        st.sidebar.success("Config cache ryddet.")
+    except Exception:
+        try:
+            st.cache_data.clear()
+            st.sidebar.success("st.cache_data cleared.")
+        except Exception:
+            st.sidebar.info("Genstart app for fuld reload.")
+
+# Reset feedback storage
+if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        cols = LEADING_COLUMNS + METADATA_COLUMNS
+        pd.DataFrame(columns=cols).to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
+        try:
+            pd.DataFrame(columns=cols).to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
+        except Exception:
+            pass
+        st.sidebar.success("Feedback storage reset.")
+    except Exception as e:
+        st.sidebar.error(f"Kunne ikke reset feedback storage: {e}")
+
+# Download links
+if os.path.exists(FEEDBACK_CSV):
+    try:
+        with open(FEEDBACK_CSV, "rb") as fh:
+            csv_bytes = fh.read()
+        st.sidebar.download_button("Download feedback CSV", data=csv_bytes, file_name=os.path.basename(FEEDBACK_CSV), mime="text/csv")
+    except Exception:
+        pass
+
+if os.path.exists(FEEDBACK_XLSX):
+    try:
+        with open(FEEDBACK_XLSX, "rb") as fh:
+            xlsx_bytes = fh.read()
+        st.sidebar.download_button("Download feedback XLSX", data=xlsx_bytes, file_name=os.path.basename(FEEDBACK_XLSX), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception:
+        pass
+
+# ---------------- Helper: get OpenAI key at call time ----------------
+def _get_openai_key() -> str:
+    """Resolve OpenAI API key from st.secrets or environment at call time."""
+    try:
+        if isinstance(st.secrets, dict):
+            key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+        else:
+            key = os.getenv("OPENAI_API_KEY", "")
+    except Exception:
+        key = os.getenv("OPENAI_API_KEY", "")
+    return key.strip() if key else ""
 
 # ---------------- YAML loader (mtime aware) ----------------
 @st.cache_data(ttl=3600)
@@ -290,12 +343,24 @@ def create_chat_completion(messages: List[Dict[str, str]],
                            max_tokens: int = 400,
                            temperature: float = 0.2,
                            top_p: float = 1.0) -> Tuple[str, Any]:
+    """
+    Call OpenAI using SDK if available; otherwise use REST.
+    Resolves API key at call-time from st.secrets or environment to avoid NameError.
+    """
     model = model or DEFAULT_MODEL
-    if openai is not None:
+    OPENAI_API_KEY = _get_openai_key()
+
+    # Try SDK path if openai package present
+    if openai is not None and OPENAI_API_KEY:
         try:
+            # Some OpenAI SDK variants expect openai.api_key, others use OpenAI class
+            try:
+                openai.api_key = OPENAI_API_KEY
+            except Exception:
+                pass
             OpenAI = getattr(openai, "OpenAI", None)
             if OpenAI:
-                client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else OpenAI()
+                client = OpenAI(api_key=OPENAI_API_KEY)
                 resp = client.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -308,8 +373,25 @@ def create_chat_completion(messages: List[Dict[str, str]],
                 except Exception:
                     text = str(resp)
                 return text, resp
+            else:
+                # older openai sdk
+                try:
+                    resp = openai.ChatCompletion.create(
+                        model=model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p
+                    )
+                    text = resp.choices[0].message["content"]
+                    return text, resp
+                except Exception:
+                    pass
         except Exception:
+            # fall through to REST
             pass
+
+    # REST fallback — require API key
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not available for REST fallback.")
     url = "https://api.openai.com/v1/chat/completions"
