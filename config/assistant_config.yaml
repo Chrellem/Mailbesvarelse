@@ -10,7 +10,7 @@ instruction: |
   response_guidelines:
     - "Respond clearly, informatively, and politely."
     - "Use only the information and procedures that appear in the available code – no assumptions or external sources."
-    - "If the question cannot be fully answered with the available information, clearly state which information is missing."
+    - "If the question cannot be fully answered with the available information, do not comment on it in the response, however mention unavaible information below the answer"
     - "If documentation or translation requirements for foreign diplomas are mentioned in the code, they must be included exactly as described."
     - "Avoid including any processes, documents, or rules that are not explicitly described in the code."
     - "Always first assess what information the codebase actually contains before providing an answer."
