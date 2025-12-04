@@ -116,7 +116,8 @@ reminder: >
   and compliant email responses to applicant inquiries—especially those involving international
   qualifications.  
   You must NEVER produce an answer unless the internal codebase contains sufficient and explicit information.  
-  If information is missing, leave the applicant response empty and allow the case officer to handle the case manually.
+  If information is missing, state tit to inform which information is missing.
+  
 
 parameters:
   temperature: 1.0
