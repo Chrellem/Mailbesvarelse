@@ -271,6 +271,37 @@ def load_faq_kb(path: str) -> List[Dict[str, str]]:
 # ---------------- Matching / detection ----------------
 def normalize_text(s: str) -> str:
     return (s or "").strip().lower()
+def detect_language(text: str) -> str:
+    """
+    Enkel heuristisk sprogdetektor: returnerer 'da' for dansk eller 'en' for engelsk.
+    Den tæller forekomsten af et sæt sproglige nøgleord for hvert sprog.
+    Er bevidst konservativ: vælger dansk kun hvis danske tokens >= engelske tokens.
+    """
+    if not text:
+        return "da"  # fallback til dansk (kan ændres til 'en' hvis ønsket)
+
+    t = (text or "").lower()
+
+    # typiske danske ord/tokens
+    danish_tokens = [
+        "hej", "tak", "venlig", "venligst", "hvad", "hvordan", "jeg", "ikke",
+        "årsag", "bemærk", "svare", "svaret", "afdeling", "uddannelse", "studie",
+        "tilmelding", "optagelse", "ansøg", "oplysninger", "dato", "tidspunkt"
+    ]
+
+    # typiske engelske ord/tokens
+    english_tokens = [
+        "hello", "thanks", "please", "how", "what", "i", "not",
+        "application", "admission", "program", "degree", "deadline",
+        "when", "where", "please", "thank", "regards", "best"
+    ]
+
+    dan = sum(1 for tok in danish_tokens if tok in t)
+    eng = sum(1 for tok in english_tokens if tok in t)
+
+    # If strong signal for English (more english tokens), choose English.
+    # Otherwise choose Danish if dan >= eng; this biases slightly to Danish on tie.
+    return "en" if eng > dan else "da"
 
 def score_text_overlap(a: str, b: str) -> float:
     a_tokens = set(re.findall(r'\w{3,}', (a or "").lower()))
