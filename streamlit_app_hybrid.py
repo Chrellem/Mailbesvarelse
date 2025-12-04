@@ -380,14 +380,14 @@ def detect_programs(mail_text: str, programs_kb: List[Dict[str,str]], top_n: int
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_n]
 
-def match_faq(mail_text: str, faq_kb: List[Dict[str,str]], top_k: int = 3) -> List[Tuple[Dict[str,str], float]]:
+def match_faq(mail_text: str, faq_kb: List[Dict[str,str]], top_k: int = 5) -> List[Tuple[Dict[str,str], float]]:
     scored: List[Tuple[Dict[str,str], float]] = []
     t = normalize_text(mail_text)
     for row in faq_kb:
         q = normalize_text(row.get("question", ""))
         a = normalize_text(row.get("answer", ""))
         score = score_text_overlap(t, q) * 2.0
-        score += score_text_overlap(t, a) * 0.5
+        score += score_text_overlap(t, a) * 1.0
         if q and q in t:
             score += 3.0
         if score > 0:
