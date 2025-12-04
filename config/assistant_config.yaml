@@ -62,4 +62,4 @@ instruction: |
 
 temperature: 1.0
 top_p: 0.2
-model: "gpt-3.5-turbo"
+model: "gpt-4"
