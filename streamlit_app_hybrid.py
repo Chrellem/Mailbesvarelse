@@ -1,18 +1,20 @@
 """
 streamlit_app_hybrid.py
 
-Complete Streamlit app (no password gating on downloads/reset).
+Complete Streamlit app with improved retrieval and stricter KB-grounded generation.
 
 Features:
-- KB loaders that read Excel/CSV (semikolon CSV support) for programmes and FAQ.
-- Generation via OpenAI (SDK if installed, otherwise REST).
-- Preview persistence in session_state.
-- Feedback save to local feedback/feedback.csv (primary) and feedback.xlsx (best-effort).
-- Exact feedback column order:
+- Reads Programmes and FAQ from Excel (.xlsx/.xls) or semicolon CSV.
+- Improved program detection (fuzzy/token overlap) and FAQ matching (TF-IDF fallback).
+- Strict generation function that forces the model to only use KB snippets,
+  requires the model to return used_kb_ids, and post-validates grounding.
+- Saves feedback locally to feedback/feedback.csv with exact column order:
     Mail, Svar, feedback_text, rating, assistant_instruction, generated_subject,
     program_detected, timestamp_utc (UTC+1), then metadata model, temperature, top_p, confidence
-- Sidebar: reset feedback, download buttons, assistant config view, reload config.
+- Sidebar: reset feedback (no password), download CSV/XLSX, reload assistant config.
+- Works without extra packages; installing rapidfuzz and scikit-learn improves retrieval quality.
 """
+
 from typing import List, Dict, Any, Tuple
 import os
 import re
@@ -20,6 +22,7 @@ import json
 import ssl
 import urllib.request
 import time
+import hashlib
 from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
 
@@ -27,7 +30,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-# Optional libs
+# optional libs
 try:
     import yaml
 except Exception:
@@ -37,6 +40,20 @@ try:
     import openai
 except Exception:
     openai = None
+
+# Optional retrieval libs
+try:
+    from rapidfuzz import fuzz
+    RF_AVAILABLE = True
+except Exception:
+    RF_AVAILABLE = False
+
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKL_AVAILABLE = True
+except Exception:
+    SKL_AVAILABLE = False
 
 load_dotenv()
 
@@ -81,18 +98,21 @@ assistant_prompt_ui = st.sidebar.text_area(
 if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
 
-if st.sidebar.button("Reload assistant config now"):
+# Reset feedback storage
+if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
     try:
-        load_assistant_config_with_mtime.clear()
-        st.sidebar.success("Config cache ryddet.")
-    except Exception:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+        cols = LEADING_COLUMNS + METADATA_COLUMNS
+        pd.DataFrame(columns=cols).to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
         try:
-            st.cache_data.clear()
-            st.sidebar.success("st.cache_data cleared.")
+            pd.DataFrame(columns=cols).to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
         except Exception:
-            st.sidebar.info("Genstart app for fuld reload.")
+            pass
+        st.sidebar.success(f"Feedback storage reset. New CSV at {FEEDBACK_CSV}")
+    except Exception as e:
+        st.sidebar.error(f"Could not reset feedback storage: {e}")
 
-# ---------------- Download buttons (no auth) ----------------
+# Download buttons
 if os.path.exists(FEEDBACK_CSV):
     try:
         with open(FEEDBACK_CSV, "rb") as fh:
@@ -111,19 +131,16 @@ if os.path.exists(FEEDBACK_XLSX):
     except Exception as e:
         st.sidebar.error(f"Kunne ikke forberede XLSX download: {e}")
 
-# ---------------- Reset feedback storage (no auth) ----------------
-if st.sidebar.button("Reset feedback storage (create new CSV with correct header)"):
+if st.sidebar.button("Reload assistant config now"):
     try:
-        os.makedirs(FEEDBACK_DIR, exist_ok=True)
-        cols = LEADING_COLUMNS + METADATA_COLUMNS
-        pd.DataFrame(columns=cols).to_csv(FEEDBACK_CSV, index=False, encoding="utf-8")
+        load_assistant_config_with_mtime.clear()
+        st.sidebar.success("Config cache ryddet.")
+    except Exception:
         try:
-            pd.DataFrame(columns=cols).to_excel(FEEDBACK_XLSX, index=False, engine="openpyxl")
+            st.cache_data.clear()
+            st.sidebar.success("st.cache_data cleared.")
         except Exception:
-            pass
-        st.sidebar.success(f"Feedback storage reset. New CSV at {FEEDBACK_CSV}")
-    except Exception as e:
-        st.sidebar.error(f"Could not reset feedback storage: {e}")
+            st.sidebar.info("Genstart app for fuld reload.")
 
 # ---------------- Read OPENAI key ----------------
 OPENAI_API_KEY = None
@@ -191,12 +208,12 @@ def load_assistant_config(path: str) -> Dict[str, Any]:
     return load_assistant_config_with_mtime(path, mtime)
 
 # ---------------- KB loaders (Excel/CSV tolerant) ----------------
-def _read_table_file(path: str) -> pd.DataFrame:
+def _read_table_file(path: str, sheet_name: Any = 0) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
     try:
         if path.lower().endswith(".xlsx") or path.lower().endswith(".xls"):
-            df = pd.read_excel(path, sheet_name=0, dtype=str, engine="openpyxl").fillna("")
+            df = pd.read_excel(path, sheet_name=sheet_name, dtype=str, engine="openpyxl").fillna("")
         else:
             df = pd.read_csv(path, sep=";", dtype=str, engine="python", quotechar='"', keep_default_na=False).fillna("")
     except Exception:
@@ -268,92 +285,123 @@ def load_faq_kb(path: str) -> List[Dict[str, str]]:
         })
     return out
 
-# ---------------- Matching / detection ----------------
-def normalize_text(s: str) -> str:
-    return (s or "").strip().lower()
+# ---------------- Language detection ----------------
 def detect_language(text: str) -> str:
-    """
-    Enkel heuristisk sprogdetektor: returnerer 'da' for dansk eller 'en' for engelsk.
-    Den tæller forekomsten af et sæt sproglige nøgleord for hvert sprog.
-    Er bevidst konservativ: vælger dansk kun hvis danske tokens >= engelske tokens.
-    """
     if not text:
-        return "da"  # fallback til dansk (kan ændres til 'en' hvis ønsket)
-
+        return "da"
     t = (text or "").lower()
-
-    # typiske danske ord/tokens
     danish_tokens = [
         "hej", "tak", "venlig", "venligst", "hvad", "hvordan", "jeg", "ikke",
         "årsag", "bemærk", "svare", "svaret", "afdeling", "uddannelse", "studie",
         "tilmelding", "optagelse", "ansøg", "oplysninger", "dato", "tidspunkt"
     ]
-
-    # typiske engelske ord/tokens
     english_tokens = [
         "hello", "thanks", "please", "how", "what", "i", "not",
         "application", "admission", "program", "degree", "deadline",
         "when", "where", "please", "thank", "regards", "best"
     ]
-
     dan = sum(1 for tok in danish_tokens if tok in t)
     eng = sum(1 for tok in english_tokens if tok in t)
-
-    # If strong signal for English (more english tokens), choose English.
-    # Otherwise choose Danish if dan >= eng; this biases slightly to Danish on tie.
     return "en" if eng > dan else "da"
 
-def score_text_overlap(a: str, b: str) -> float:
-    a_tokens = set(re.findall(r'\w{3,}', (a or "").lower()))
-    b_tokens = set(re.findall(r'\w{3,}', (b or "").lower()))
-    if not a_tokens or not b_tokens:
-        return 0.0
-    return float(len(a_tokens.intersection(b_tokens)))
+# ---------------- Retrieval helpers ----------------
+def _word_tokens(s: str) -> List[str]:
+    return re.findall(r'\w{3,}', (s or "").lower())
 
+def token_overlap_ratio(a: str, b: str) -> float:
+    atoks = set(_word_tokens(a))
+    btoks = set(_word_tokens(b))
+    if not atoks or not btoks:
+        return 0.0
+    return len(atoks & btoks) / max(1, len(atoks))
+
+# ---------------- Improved detect_programs ----------------
 def detect_programs(mail_text: str, programs_kb: List[Dict[str,str]], top_n: int = 3) -> List[Tuple[Dict[str,str], float]]:
-    t = normalize_text(mail_text)
+    t = (mail_text or "").lower()
     scored: List[Tuple[Dict[str,str], float]] = []
     if not programs_kb:
         return scored
     for row in programs_kb:
-        pname = normalize_text(row.get("programme",""))
-        adm = normalize_text(row.get("admission",""))
-        kw = normalize_text(row.get("keywords",""))
-        short = normalize_text(row.get("short_description",""))
+        name = (row.get("programme") or row.get("program") or "").strip()
+        kw = (row.get("keywords") or "").strip()
+        short = (row.get("short_description") or "").strip()
+        adm = (row.get("admission") or "").strip()
         score = 0.0
-        if pname and pname in t:
-            score += 6.0
-        score += 2.0 * score_text_overlap(pname, t)
-        score += 1.5 * score_text_overlap(kw, t)
-        score += 0.8 * score_text_overlap(short, t)
-        score += 0.5 * score_text_overlap(adm, t)
+        if name and name.lower() in t:
+            score += 8.0
+        if RF_AVAILABLE and name:
+            try:
+                f = fuzz.token_set_ratio(name.lower(), t) / 100.0
+                score += 6.0 * f
+            except Exception:
+                score += 3.0 * token_overlap_ratio(name, t)
+        else:
+            score += 3.0 * token_overlap_ratio(name, t)
+        if RF_AVAILABLE and kw:
+            try:
+                f2 = fuzz.token_set_ratio(kw.lower(), t) / 100.0
+                score += 3.0 * f2
+            except Exception:
+                score += 1.5 * token_overlap_ratio(kw, t)
+        else:
+            score += 1.5 * token_overlap_ratio(kw, t)
+        score += 0.8 * token_overlap_ratio(short, t)
+        score += 0.4 * token_overlap_ratio(adm, t)
         if score > 0:
             scored.append((row, float(score)))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_n]
 
+# ---------------- Improved match_faq ----------------
 def match_faq(mail_text: str, faq_kb: List[Dict[str,str]], top_k: int = 3) -> List[Tuple[Dict[str,str], float]]:
-    t = normalize_text(mail_text)
-    scored = []
+    t = (mail_text or "").strip()
     if not faq_kb:
-        return scored
+        return []
+    candidates = []
     for row in faq_kb:
-        q = normalize_text(row.get("question",""))
-        a = normalize_text(row.get("answer",""))
-        score = score_text_overlap(t, q) * 2.0
-        score += score_text_overlap(t, a) * 0.5
-        if row.get("category") and row.get("category").lower() in t:
-            score += 1.0
+        q = row.get("question", "") or ""
+        short = row.get("short_answer", "") or ""
+        full = row.get("answer", "") or ""
+        candidates.append(" ".join([q, short, full]))
+    scores = []
+    if SKL_AVAILABLE and len(candidates) >= 1:
+        try:
+            vect = TfidfVectorizer(ngram_range=(1,2), stop_words='english')
+            X = vect.fit_transform(candidates)
+            vq = vect.transform([t])
+            sims = cosine_similarity(vq, X)[0]
+            for idx, sim in enumerate(sims):
+                if sim > 0:
+                    scores.append((faq_kb[idx], float(sim)))
+            scores.sort(key=lambda x: x[1], reverse=True)
+            return scores[:top_k]
+        except Exception:
+            pass
+    for row in faq_kb:
+        q = row.get("question", "") or ""
+        full = row.get("answer", "") or ""
+        score = 0.0
+        score += 2.0 * token_overlap_ratio(q, t)
+        score += 0.7 * token_overlap_ratio(full, t)
+        cat = (row.get("category") or "").lower()
+        if cat and cat in t:
+            score += 0.8
+        if RF_AVAILABLE and q:
+            try:
+                f = fuzz.token_set_ratio(q.lower(), t) / 100.0
+                score += 1.5 * f
+            except Exception:
+                pass
         if score > 0:
-            scored.append((row, float(score)))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:top_k]
+            scores.append((row, float(score)))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return scores[:top_k]
 
-# ---------------- OpenAI wrapper ----------------
+# ---------------- OpenAI wrapper (same as before) ----------------
 def create_chat_completion(messages: List[Dict[str, str]],
                            model: str = None,
                            max_tokens: int = 400,
-                           temperature: float = 0.2,
+                           temperature: float = 0.0,
                            top_p: float = 1.0) -> Tuple[str, Any]:
     model = model or DEFAULT_MODEL
     if openai is not None:
@@ -400,30 +448,54 @@ def create_chat_completion(messages: List[Dict[str, str]],
         text = json.dumps(j)[:2000]
     return text, j
 
-# ---------------- Generation function (JSON output expected) ----------------
+# ---------------- Strict KB-only generation (improved) ----------------
 def generate_combined_reply(mail_text: str,
                             program_rows: List[Dict[str,str]] = None,
                             faq_rows: List[Dict[str,str]] = None,
                             language: str = "da",
                             openai_model: str = None,
                             assistant_instruction: str = None,
-                            temperature: float = 0.2,
-                            top_p: float = 1.0) -> Dict[str, Any]:
+                            temperature: float = 0.0,
+                            top_p: float = 1.0,
+                            kb_max_chars: int = 2000) -> Dict[str, Any]:
     model = openai_model or DEFAULT_MODEL
-    kb_block = build_kb_block(program_rows, faq_rows)
+    kb_items = []
+    if program_rows:
+        for r in program_rows:
+            rid = str(r.get("id") or r.get("ID") or (r.get("programme") or "")[:60])
+            prog = r.get("programme", "")
+            adm = r.get("admission", "")
+            text = f"PROGRAM|{rid}|{prog}\nADMISSION: {adm}"
+            kb_items.append({"id": rid, "type": "program", "text": text})
+    if faq_rows:
+        for r in faq_rows:
+            rid = str(r.get("id") or r.get("ID") or "")
+            q = r.get("question", "")
+            a = r.get("answer", "")
+            text = f"FAQ|{rid}|Q: {q}\nA: {a}"
+            kb_items.append({"id": rid, "type": "faq", "text": text})
+    kb_concat = ""
+    used_kb_texts = []
+    for it in kb_items:
+        snippet = it["text"]
+        if len(kb_concat) + len(snippet) + 50 > kb_max_chars:
+            continue
+        kb_concat += f"\n---\nID:{it['id']}\n{snippet}\n"
+        used_kb_texts.append((it['id'], snippet))
     lang_name = "dansk" if language == "da" else "english"
     base_system = (
-        f"You are a helpful assistant that must answer a prospective student's question. "
-        f"YOU MUST ONLY use the information provided in the 'KB block' below. Do NOT invent or assume anything. "
-        f"If the KB does not contain enough information to answer, respond with a short clarification question asking for the missing info. "
-        f"Reply in {lang_name}. Output must be a single JSON object with keys: subject, body, confidence (0-1), notes."
+        f"You are a strict KB-grounded assistant answering in {lang_name}. "
+        "YOU MUST ONLY use facts present in the 'KB block' provided below. "
+        "If the KB does not contain enough information, respond with one short clarification question. "
+        "You MUST return exactly one JSON object and nothing else, with keys: "
+        "\"subject\" (string), \"body\" (string), \"confidence\" (0-1), \"notes\" (string), and \"used_kb_ids\" (array of ids). "
+        "The 'body' must be fully supported by the KB and must not include invented content."
     )
     messages = [{"role": "system", "content": base_system}]
-    instr = assistant_instruction or st.session_state.get("assistant_prompt", None)
-    if instr:
-        messages.append({"role": "assistant", "content": instr})
-    user = f"Mail:\n'''{mail_text}'''\n\nKB block:\n{kb_block}\n\nInstructions:\n- Answer the most important question first.\n- If the mail refers to a specific programme, refer to it by name.\n- Keep the reply concise and practical.\n- If KB is insufficient, ask one clear follow-up question.\nReturn only JSON."
-    messages.append({"role": "user", "content": user})
+    if assistant_instruction:
+        messages.append({"role": "assistant", "content": assistant_instruction})
+    user_msg = f"Mail:\n'''{mail_text}'''\n\nKB block (only use info here):\n{kb_concat}\n\nReturn only the JSON object as specified."
+    messages.append({"role": "user", "content": user_msg})
     try:
         st.session_state["last_messages_sent"] = messages
     except Exception:
@@ -431,20 +503,76 @@ def generate_combined_reply(mail_text: str,
     try:
         out_text, resp = create_chat_completion(messages, model=model, max_tokens=700, temperature=temperature, top_p=top_p)
     except Exception as e:
-        return {"subject": "", "body": f"Fejl ved opkald til model: {e}", "confidence": 0.0, "notes": "LLM call failed"}
+        return {"subject": "", "body": f"Fejl ved opkald til model: {e}", "confidence": 0.0, "notes": "LLM call failed", "used_kb_ids": []}
+    parsed = None
     try:
         parsed = json.loads(out_text)
-        return parsed
     except Exception:
         m = re.search(r'(\{[\s\S]*\})', out_text)
         if m:
             try:
                 parsed = json.loads(m.group(1))
-                return parsed
             except Exception:
-                pass
-    return {"subject": "", "body": out_text, "confidence": 0.0, "notes": "Kunne ikke parse JSON fra model; se body"}
+                parsed = None
+    if not parsed or not isinstance(parsed, dict):
+        return {
+            "subject": "",
+            "body": "Jeg har ikke tilstrækkelig information i vidensbasen til at besvare dette. Kan du uddybe?",
+            "confidence": 0.0,
+            "notes": "Model response not valid JSON or didn't follow KB-only format.",
+            "used_kb_ids": []
+        }
+    used_ids = parsed.get("used_kb_ids", [])
+    if not isinstance(used_ids, list):
+        used_ids = []
+    allowed_ids = set(it[0] for it in used_kb_texts)
+    invalid_ids = [i for i in used_ids if str(i) not in allowed_ids]
+    if invalid_ids:
+        return {
+            "subject": "",
+            "body": "Jeg kan ikke besvare dette ud fra de tilgængelige oplysninger i vidensbasen. Kan du give flere oplysninger?",
+            "confidence": 0.0,
+            "notes": f"Model cited KB ids not provided: {invalid_ids}",
+            "used_kb_ids": []
+        }
+    body_text = parsed.get("body", "") or ""
+    if not body_text.strip():
+        return {
+            "subject": parsed.get("subject", ""),
+            "body": "Jeg har ikke nok information i KB til at svare — venligst præcisér dit spørgsmål.",
+            "confidence": 0.0,
+            "notes": "Empty body from model.",
+            "used_kb_ids": used_ids
+        }
+    kb_union_text = " ".join([s for (_id, s) in used_kb_texts])
+    body_tokens = set(_word_tokens(body_text))
+    kb_tokens = set(_word_tokens(kb_union_text))
+    if not body_tokens:
+        grounding_ratio = 0.0
+    else:
+        grounding_ratio = len(body_tokens & kb_tokens) / len(body_tokens)
+    if grounding_ratio < 0.45:
+        return {
+            "subject": "",
+            "body": "Jeg kan ikke besvare dette ud fra de tilgængelige oplysninger i vidensbasen. Kan du uddybe?",
+            "confidence": 0.0,
+            "notes": f"Answer not sufficiently grounded in KB (grounding_ratio={grounding_ratio:.2f}).",
+            "used_kb_ids": used_ids
+        }
+    try:
+        conf = float(parsed.get("confidence", 0.0))
+        conf = max(0.0, min(1.0, conf))
+    except Exception:
+        conf = 0.0
+    return {
+        "subject": parsed.get("subject", "") or "",
+        "body": body_text,
+        "confidence": conf,
+        "notes": parsed.get("notes", "") or "",
+        "used_kb_ids": used_ids
+    }
 
+# ---------------- build_kb_block for context display ----------------
 def build_kb_block(program_rows: List[Dict[str,str]] = None, faq_rows: List[Dict[str,str]] = None) -> str:
     parts: List[str] = []
     if program_rows:
@@ -488,20 +616,18 @@ def save_feedback_row_local(row: Dict[str, Any], csv_path: str = FEEDBACK_CSV, x
         return False, f"Failed to save locally: {e}"
 
 def save_feedback(row_dict: Dict[str, Any]) -> Tuple[bool, str]:
-    # Currently only local save (CSV primary). Could extend to remote backends later.
     return save_feedback_row_local(row_dict)
 
-# ---------------- Main UI flow ----------------
+# ---------------- UI: main flow ----------------
 programs_kb = load_programs_kb(st.session_state.get("programs_kb_path", PROGRAMS_KB_DEFAULT))
 faq_kb = load_faq_kb(st.session_state.get("faq_kb_path", FAQ_KB_DEFAULT))
 
 st.subheader("Indtast mail til analyse")
-
 with st.form("email_form"):
     body = st.text_area("Mail (indsæt hele beskeden her)", value="", height=300)
     submitted = st.form_submit_button("Preview svar")
 
-# clear pending reset for session-state safety
+# clear pending feedback clear
 if st.session_state.get("feedback_clear_pending"):
     st.session_state["feedback_text_input"] = ""
     st.session_state["feedback_rating"] = ""
@@ -516,9 +642,7 @@ if submitted:
             del st.session_state[k]
     combined = body or ""
     st.session_state["last_mail_text"] = combined
-
-    # detect language & KB matches
-    language = detect_language(combined) if "detect_language" in globals() else "da"
+    language = detect_language(combined)
     program_candidates = detect_programs(combined, programs_kb, top_n=4) if programs_kb else []
     uddannelses_relateret = False
     selected_program_rows = None
@@ -526,30 +650,27 @@ if submitted:
         uddannelses_relateret = True
         top_row = program_candidates[0][0]
         selected_program_rows = [r for r in programs_kb if r.get("programme","").strip().lower() == top_row.get("programme","").strip().lower()]
-
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
-
     assistant_instruction_to_use = None
     assistant_config = load_assistant_config(st.session_state.get("assistant_config_path", ASSISTANT_CONFIG_DEFAULT))
     if assistant_config and isinstance(assistant_config, dict):
         assistant_instruction_to_use = assistant_config.get("instruction")
     if not assistant_instruction_to_use:
         assistant_instruction_to_use = st.session_state.get("assistant_prompt", None)
-
-    used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.2
+    used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.0
     used_top_p = float(assistant_config.get("top_p")) if assistant_config and assistant_config.get("top_p") is not None else 1.0
     used_model = assistant_config.get("model") or DEFAULT_MODEL
-
+    # Use stricter generation: temperature default 0.0 to reduce hallucinations
     reply = generate_combined_reply(combined,
                                     program_rows=selected_program_rows if uddannelses_relateret else None,
                                     faq_rows=faq_to_use,
                                     language=language,
                                     openai_model=used_model,
                                     assistant_instruction=assistant_instruction_to_use,
-                                    temperature=used_temp,
-                                    top_p=used_top_p)
-
+                                    temperature=used_temp if used_temp is not None else 0.0,
+                                    top_p=used_top_p if used_top_p is not None else 1.0,
+                                    kb_max_chars=2000)
     st.session_state["previewed"] = True
     st.session_state["last_generated_reply"] = reply
     st.session_state["last_generated_meta"] = {
@@ -573,22 +694,18 @@ if st.session_state.get("previewed"):
         st.markdown(f"**Uddannelse relateret: JA — valgt program:** {program_name}")
     else:
         st.markdown("**Uddannelse relateret: NEJ**")
-
     generated_subject = meta.get("generated_subject", "") or reply.get("subject", "")
     st.text_input("Genereret emne (edit)", value=generated_subject, key="reply_subj")
     generated_body = reply.get("body") or ""
     st.markdown("**Genereret svar (rediger hvis nødvendigt):**")
     st.text_area("Genereret svar (edit)", value=generated_body, height=360, key="reply_body")
-
     st.markdown(f"**Generation params:** model={meta.get('model')}, temperature={meta.get('temperature')}, top_p={meta.get('top_p')}")
     st.markdown(f"**Confidence (model estimate):** {reply.get('confidence', 0):.2f}")
     if reply.get("notes"):
         st.info(f"Notes: {reply.get('notes')}")
-
     st.markdown("### Feedback på dette svar")
     feedback_text = st.text_area("Skriv din feedback her", value=st.session_state.get("feedback_text_input", ""), height=160, key="feedback_text_input")
     rating = st.selectbox("Vurder svar (valgfrit)", options=["", "1 - meget utilfreds", "2", "3", "4", "5 - meget tilfreds"], index=0, key="feedback_rating")
-
     if st.button("Gem feedback", key="save_feedback_btn"):
         mail_body_orig = meta.get("mail_body", "")
         generated_body_current = st.session_state.get("reply_body", generated_body)
@@ -597,7 +714,6 @@ if st.session_state.get("previewed"):
         program_name = meta.get("program_detected", "")
         now_utc1 = datetime.now(timezone.utc) + timedelta(hours=1)
         timestamp = now_utc1.isoformat()
-
         od = OrderedDict()
         od["Mail"] = mail_body_orig
         od["Svar"] = generated_body_current
@@ -611,7 +727,6 @@ if st.session_state.get("previewed"):
         od["temperature"] = meta.get("temperature", "")
         od["top_p"] = meta.get("top_p", "")
         od["confidence"] = confidence
-
         ok, msg = save_feedback(dict(od))
         if ok:
             st.success("Feedback gemt. " + msg)
@@ -622,7 +737,6 @@ if st.session_state.get("previewed"):
                 st.stop()
         else:
             st.error(msg)
-
     messages_debug = st.session_state.get("last_messages_sent")
     if messages_debug:
         st.markdown("**Messages sent to model (debug)**")
@@ -630,7 +744,6 @@ if st.session_state.get("previewed"):
             st.text_area("messages", value=json.dumps(messages_debug, ensure_ascii=False, indent=2), height=200)
         except Exception:
             st.text_area("messages (repr)", value=str(messages_debug)[:4096], height=200)
-
 else:
     st.info("Indtast mail i 'Mail' feltet og klik Preview svar for automatisk svarudkast.")
 
