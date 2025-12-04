@@ -9,8 +9,9 @@ Reverted to a simpler, earlier version (stable) with:
 - Local feedback save to feedback/feedback.csv (and feedback.xlsx best-effort).
 - Sidebar: reset feedback, download CSV/XLSX, reload assistant config.
 
-This is intended to match the previous stable layout (the "version 47" you referenced),
-including the detect_language fix you asked for.
+This version includes a sidebar checkbox "Use YAML only for assistant prompt (no fallback)"
+which, when enabled, forces the app to use the YAML 'instruction' value only and not fall
+back to the assistant prompt stored in the UI session_state.
 """
 from typing import List, Dict, Any, Tuple
 import os
@@ -79,6 +80,15 @@ assistant_prompt_ui = st.sidebar.text_area(
 )
 if assistant_prompt_ui is not None:
     st.session_state["assistant_prompt"] = assistant_prompt_ui
+
+# New: option to force YAML-only prompt (no fallback)
+st.sidebar.markdown("### Prompt source")
+use_yaml_only = st.sidebar.checkbox(
+    "Use YAML only for assistant prompt (no fallback)",
+    value=st.session_state.get("use_yaml_only", False),
+    key="use_yaml_only"
+)
+st.session_state["use_yaml_only"] = use_yaml_only
 
 if st.sidebar.button("Reload assistant config now"):
     try:
@@ -519,12 +529,20 @@ if submitted:
     faq_matches = match_faq(combined, faq_kb, top_k=FAQ_MATCH_TOPK) if faq_kb else []
     faq_to_use = [r for r, s in faq_matches][:FAQ_MATCH_TOPK] if faq_matches else []
 
+    # Assistant instruction selection respecting "use_yaml_only" checkbox
     assistant_instruction_to_use = None
     assistant_config = load_assistant_config(st.session_state.get("assistant_config_path", ASSISTANT_CONFIG_DEFAULT))
     if assistant_config and isinstance(assistant_config, dict):
         assistant_instruction_to_use = assistant_config.get("instruction")
+
     if not assistant_instruction_to_use:
-        assistant_instruction_to_use = st.session_state.get("assistant_prompt", None)
+        if st.session_state.get("use_yaml_only"):
+            # YAML enforced but missing: show error and set to empty string to avoid fallback
+            st.sidebar.error("YAML missing key 'instruction' eller fil ikke fundet. Tjek 'Assistant config path' eller slå 'Use YAML only' fra.")
+            assistant_instruction_to_use = ""
+        else:
+            # legacy behavior: use session_state fallback
+            assistant_instruction_to_use = st.session_state.get("assistant_prompt", None)
 
     used_temp = float(assistant_config.get("temperature")) if assistant_config and assistant_config.get("temperature") is not None else 0.2
     used_top_p = float(assistant_config.get("top_p")) if assistant_config and assistant_config.get("top_p") is not None else 1.0
